@@ -57,6 +57,47 @@ def gh(method, path, body=None, raw=False):
         return r.status, r.read()
 
 
+def raw_file(path):
+    """raw.githubusercontent.com から読む（回数制限なし・最大5分ほど古い場合あり）"""
+    url = f"https://raw.githubusercontent.com/{REPO}/data/{path}"
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "ymobile-shop-checker"}),
+                                    timeout=20) as r:
+            return r.read()
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise
+
+
+def available():
+    """保存済みの [(県, 目的)]"""
+    with _lock:
+        hit = _snap_cache.get("__list__")
+        if hit and time.time() - hit[0] < 60:
+            return hit[1]
+    names = []
+    try:
+        _, body = gh("GET", f"/repos/{REPO}/contents/data?ref=data")
+        names = [x["name"] for x in json.loads(body)]
+    except Exception:  # noqa: BLE001
+        cfg = config()  # 取れなければ自動更新の対象から推測
+        names = [snapshot_name(p, ym.norm_purpose(u)) for p in cfg.get("snapshot_prefs") or []
+                 if p in ym.PREFS for u in cfg.get("snapshot_purposes") or ["mnp_out"]]
+    out = []
+    for n in names:
+        try:
+            code, purpose = n[:-5].split("_", 1)
+            if purpose in ym.PURPOSES:
+                out.append({"pref": ym.PREFS[int(code) - 1], "purpose": purpose,
+                            "label": f"{ym.PREFS[int(code) - 1]}・{ym.PURPOSES[purpose][0]}"})
+        except (ValueError, IndexError):
+            continue
+    with _lock:
+        _snap_cache["__list__"] = (time.time(), out)
+    return out
+
+
 def load_snapshot(name):
     """data ブランチの JSON（bytes）。なければ None"""
     with _lock:
@@ -66,9 +107,11 @@ def load_snapshot(name):
     try:
         _, body = gh("GET", f"/repos/{REPO}/contents/data/{name}?ref=data", raw=True)
     except urllib.error.HTTPError as e:
-        if e.code != 404:
-            raise
-        body = None
+        if e.code == 404:
+            body = None
+        else:
+            # トークンなしだと GitHub API は回数制限（403/429）にかかりやすいので raw で読む
+            body = raw_file(f"data/{name}")
     with _lock:
         _snap_cache[name] = (time.time(), body)
     return body
@@ -106,7 +149,7 @@ def api_snapshot():
     except Exception as e:  # noqa: BLE001
         return jsonify(error=f"GitHub から結果を読めませんでした（{e}）"), 502
     if body is None:
-        return jsonify(missing=True)
+        return jsonify(missing=True, available=available())
     if "gzip" in request.headers.get("Accept-Encoding", ""):
         return Response(gzip.compress(body, 6), mimetype="application/json",
                         headers={"Content-Encoding": "gzip", "Cache-Control": "no-store"})
@@ -278,13 +321,32 @@ async function load(){
     const j = await getJSON(`/api/snapshot?${q()}`);
     if (my !== polling) return;
     if (j.missing) {
-      $("#stext").textContent = "この県・目的のデータはまだありません。";
-      if (CAN_REFRESH) refresh(true);
+      if (CAN_REFRESH) { $("#stext").textContent = "この県・目的のデータはまだないので取得します。"; refresh(true); return; }
+      showMissing(j.available || []);
       return;
     }
     snap = j; render();
     if (CAN_REFRESH && (Date.now() - new Date(j.updated_at).getTime()) > 20*60000) refresh(true);
   } catch(e) { if (my === polling) $("#stext").textContent = "⚠ " + e.message; }
+}
+
+function showMissing(av){
+  $("#stext").textContent = `${$("#pref").value}・${$("#purpose").selectedOptions[0].text} のデータはまだありません。`;
+  const list = $("#list"); list.innerHTML = "";
+  const box = el("div","card");
+  if (av.length) {
+    box.append(el("div","meta","保存済みのデータ（タップで表示）"));
+    av.forEach(a => {
+      const b = el("button","btn", a.label); b.style.margin = "8px 8px 0 0";
+      b.onclick = () => { $("#pref").value = a.pref; $("#purpose").value = a.purpose; load(); };
+      box.append(b);
+    });
+  }
+  box.append(el("div","meta",
+    "ほかの県・目的を見るには、Render に GITHUB_TOKEN を設定して「最新にする」を使うか、" +
+    "config.json の snapshot_prefs / snapshot_purposes に追加してください（30分ごとに自動取得）。"));
+  box.lastChild.style.marginTop = "10px";
+  list.append(box);
 }
 
 async function refresh(auto){
