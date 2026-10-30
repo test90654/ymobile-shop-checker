@@ -120,21 +120,20 @@ button{font:inherit;border:0;border-radius:10px;padding:9px 12px;cursor:pointer}
 @media (prefers-color-scheme: dark){.bar button{background:rgba(0,0,0,.14)}}
 main{padding:12px 16px 40px;max-width:640px;margin:0 auto}
 .legend{display:flex;flex-wrap:wrap;gap:10px;font-size:12px;color:var(--sub);margin:4px 0 12px}
-.legend span b{display:inline-block;width:20px;text-align:center;border-radius:5px;margin-right:3px}
+
 .status{font-size:13px;color:var(--sub);margin:6px 0 10px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:12px}
 .card h2{font-size:16px;margin:0 0 2px}
 .meta{font-size:12.5px;color:var(--sub)}
 .notice{font-size:12.5px;color:var(--few);margin-top:4px}
-.grid{display:grid;grid-template-columns:repeat(7,1fr);gap:5px;margin-top:12px}
-.day{border:0;border-radius:9px;padding:6px 0 5px;text-align:center;font-size:11.5px;line-height:1.25}
-.day .m{display:block;font-size:17px;font-weight:700}
-.circle{background:var(--okbg);color:var(--ok)} .triangle{background:var(--fewbg);color:var(--few)}
-.phone{background:var(--telbg);color:var(--tel)} .holiday,.close{background:var(--offbg);color:var(--off)}
-.day.sel{outline:2px solid var(--ink);outline-offset:-2px}
-.slots{margin-top:10px;font-size:14px;display:none}
-.slots.show{display:block}
-.chip{display:inline-block;background:var(--okbg);color:var(--ok);border-radius:8px;padding:3px 8px;margin:3px 4px 0 0;font-variant-numeric:tabular-nums}
+.days{margin-top:10px;border-top:1px solid var(--line)}
+.row{display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-bottom:1px solid var(--line)}
+.date{flex:0 0 64px;font-weight:600;font-size:14px;padding-top:3px;font-variant-numeric:tabular-nums}
+.date.sat{color:var(--tel)} .date.sun{color:#c92a2a}
+.times{flex:1;display:flex;flex-wrap:wrap;gap:5px}
+.chip{background:var(--okbg);color:var(--ok);border-radius:8px;padding:3px 8px;font-size:14px;font-weight:600;font-variant-numeric:tabular-nums}
+.nochip{color:var(--off);font-size:13px;padding-top:3px}
+.row.none .date{color:var(--off)}
 .actions{display:flex;gap:8px;margin-top:12px}
 .actions a{flex:1;text-align:center;text-decoration:none;border-radius:10px;padding:9px;font-size:14px}
 .primary{background:var(--accent);color:#fff}
@@ -149,16 +148,13 @@ main{padding:12px 16px 40px;max-width:640px;margin:0 auto}
 <header>
   <h1>ワイモバイル 来店予約の空き</h1>
   <div class="bar">
-    <button id="here">📍 現在地の近く</button>
-    <button id="home">🏠 いつもの場所</button>
+    <button id="here">📍 現在地</button>
+    <button id="home">🏠 いつもの</button>
     <button id="reload">↻ 更新</button>
   </div>
 </header>
 <main>
-  <div class="legend">
-    <span><b class="circle">◎</b>空きが多い</span><span><b class="triangle">△</b>残りわずか</span>
-    <span><b class="phone">☎</b>電話で確認</span><span><b class="holiday">休</b>定休日</span>
-  </div>
+  <div class="legend">緑の時間帯がWeb来店予約で空いている時間です（2週間分）</div>
   <div class="status" id="status">読み込み中…</div>
   <div id="list"></div>
 </main>
@@ -208,20 +204,17 @@ async function fillShop(s, body){
   try { data = await getJSON(`/api/shop/${encodeURIComponent(s.code)}`); }
   catch(e){ body.innerHTML = ""; body.append(el("div","err", e.message)); return; }
   body.innerHTML = "";
-  const grid = el("div","grid"); const slots = el("div","slots");
+  const list = el("div","days");
   data.days.forEach(d => {
-    const b = el("button","day " + d.status);
-    b.append(el("span","m", d.mark), document.createTextNode(d.label.replace(/\(.\)/,"")));
-    b.onclick = () => {
-      grid.querySelectorAll(".sel").forEach(x => x.classList.remove("sel"));
-      b.classList.add("sel"); slots.innerHTML = ""; slots.classList.add("show");
-      slots.append(el("div","meta", d.label + (d.slots.length ? " の空き" : "")));
-      if (d.slots.length) d.slots.forEach(t => slots.append(el("span","chip", t)));
-      else slots.append(el("div", null, d.status==="phone" ? "Webの空きはありません（電話で確認）" : "受付していません"));
-    };
-    grid.append(b);
+    const row = el("div","row" + (d.slots.length ? "" : " none"));
+    const lab = el("div","date " + (/\(土\)/.test(d.label) ? "sat" : /\(日\)/.test(d.label) ? "sun" : ""), d.label);
+    const times = el("div","times");
+    if (d.slots.length) d.slots.forEach(t => times.append(el("span","chip", t)));
+    else times.append(el("span","nochip",
+      d.status==="holiday" ? "定休日" : d.status==="close" ? "受付終了" : "空きなし（電話で確認）"));
+    row.append(lab, times); list.append(row);
   });
-  body.append(grid, slots);
+  body.append(list);
 }
 
 $("#here").onclick = () => {
