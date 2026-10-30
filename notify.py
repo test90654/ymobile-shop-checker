@@ -138,6 +138,12 @@ def main():
             except ym.FetchError as e:
                 res = f"失敗 {e}"
             print(f'::notice title={s["code"]}::{s["name"]} {res}')
+        # 1店舗目の各日の空き時間
+        if shops:
+            cal = ym.shop_calendar(shops[0]["code"]) or []
+            for d in cal:
+                t = " ".join(f"{ym.hhmm(a)}-{ym.hhmm(b)}" for a, b in d["slots"]) or "なし"
+                print(f'::notice title={shops[0]["code"]} {d["label"]}::{t}')
         return
 
     try:
