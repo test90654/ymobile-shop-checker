@@ -8,8 +8,25 @@ import urllib.request
 
 BASE = "https://www.ymobile.jp"
 
-# 業務コード（公式サイトのJSと同じ）。(第1来店目的, 第2来店目的)
-WORK_CODES = [("7Y", "2Y"), ("80", "20")]  # ワイモバイルショップ / ソフトバンクショップ
+# 来店目的（業務コード）。目的ごとに所要時間と空き枠が違う。
+# かんたん来店予約（visit-reservation.mb.softbank.jp）の getWorkInfo で確認したもの
+PURPOSES = {
+    "I0": "MNP予約番号発行（他社へのお乗り換え）",
+    "20": "機種変更",
+    "K0": "他社⇒ワイモバイル（MNP）",
+    "J0": "ソフトバンク⇒ワイモバイル",
+    "E0": "ワイモバイル⇒ソフトバンク",
+    "30": "他社⇒ソフトバンク（MNP）",
+    "10": "新規契約",
+    "B0": "契約内容確認/変更",
+    "H0": "端末返却・下取り",
+    "60": "故障修理",
+    "80": "スマホ・ケータイの解約",
+    "N0": "店頭スマホサポート（データ移行）",
+    "L0": "店頭スマホサポート（データ移行以外）",
+}
+DEFAULT_PURPOSE = "I0"
+FALLBACK_CODES = ["7Y"]  # ワイモバイル専売店で上の業務コードが使えない場合
 
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 "
@@ -22,7 +39,6 @@ HEADERS = {
 }
 
 WEEK = "月火水木金土日"
-MARK = {"circle": "◎", "triangle": "△", "phone": "☎", "holiday": "休", "close": "×"}
 
 REQUEST_GAP_SEC = 0.8  # サイトに負荷をかけないための待ち時間
 
@@ -80,73 +96,60 @@ def _fetch_days(shop_code, work_cd, referer):
     return (blocks[0].get("dailyBlockInfoDtoList") or []) if blocks else None
 
 
-def fetch_availability(shop_code, referer=None):
-    """2週間分の生データ (days1, days2)。取得できなければ (None, None)。"""
-    referer = referer or f"{BASE}/shop/detail/{shop_code}/"
-    for cd1, cd2 in WORK_CODES:
-        days1 = _fetch_days(shop_code, cd1, referer)
-        if days1 is None:
-            continue
-        return days1, (_fetch_days(shop_code, cd2, referer) or [])
-    return None, None
+def fetch_days(shop_code, purpose=DEFAULT_PURPOSE):
+    """指定した来店目的の2週間分の生データ。取得できなければ None。"""
+    referer = f"{BASE}/shop/detail/{shop_code}/"
+    for cd in [purpose] + FALLBACK_CODES:
+        days = _fetch_days(shop_code, cd, referer)
+        if days is not None:
+            return days
+    return None
 
 
-def day_status(day1, day2):
-    """公式サイトと同じ判定: circle / triangle / phone / holiday / close"""
-    if day1.get("openStatus") == "0":
-        return "holiday"
-    if day1.get("openStatus") == "2":
-        return "close"
-    blocks1 = day1.get("blockNumDtoList") or []
-    open_flg = any(b.get("acceptanceType") == "02" for b in blocks1)
-    not_empty = any(b.get("blockNum") not in (None, 0) for b in blocks1)
-    if not (open_flg and not_empty):
-        return "phone"
-    blocks2 = (day2 or {}).get("blockNumDtoList") or []
-    empty = sum(1 for b in blocks2 if b.get("blockNum") == 0)
-    filled = sum(1 for b in blocks2 if b.get("blockNum") not in (None, 0))
-    return "triangle" if empty >= filled else "circle"
-
-
-def in_window(st, en, t_from=None, t_to=None):
-    return (not t_from or en > t_from) and (not t_to or st < t_to)
-
-
-def free_slots(day1, t_from=None, t_to=None):
-    """空き（blockNum>0）の15分枠を連続ごとにまとめて [(開始, 終了), ...]。時刻は "HHMM"。"""
+def free_starts(day, t_from=None, t_to=None):
+    """予約できる開始時刻（"HHMM"）の一覧"""
     out = []
-    for b in day1.get("blockNumDtoList") or []:
+    for b in day.get("blockNumDtoList") or []:
         if b.get("acceptanceType") != "02" or not b.get("blockNum"):
             continue
-        st, en = b["startTime"], b["endTime"]
-        if not in_window(st, en, t_from, t_to):
+        st = b["startTime"]
+        if (t_from and st < t_from) or (t_to and st > t_to):
             continue
-        if out and out[-1][1] == st:
-            out[-1] = (out[-1][0], en)
-        else:
-            out.append((st, en))
+        out.append(st)
     return out
 
 
-def shop_calendar(shop_code, t_from=None, t_to=None, dates=None):
-    """[{date, label, status, mark, slots:[(st,en)]}] を返す。取得できなければ None。"""
-    days1, days2 = fetch_availability(shop_code)
-    if days1 is None:
+def _min(t):
+    return int(t[:2]) * 60 + int(t[2:])
+
+
+def group_starts(starts):
+    """["1400","1415","1430","1515"] → ["14:00〜14:30", "15:15"]（15分おきに続く時刻をまとめる）"""
+    out, run = [], []
+    for t in starts:
+        if run and _min(t) - _min(run[-1]) != 15:
+            out.append(run)
+            run = []
+        run.append(t)
+    if run:
+        out.append(run)
+    return [hhmm(r[0]) if len(r) == 1 else f"{hhmm(r[0])}〜{hhmm(r[-1])}" for r in out]
+
+
+def shop_calendar(shop_code, purpose=DEFAULT_PURPOSE, t_from=None, t_to=None, dates=None):
+    """[{date, label, status, starts:["HHMM",...], times:["14:00〜18:45",...]}]。取得できなければ None"""
+    days = fetch_days(shop_code, purpose)
+    if days is None:
         return None
-    by2 = {d.get("nowDate"): d for d in days2}
     out = []
-    for d in days1:
+    for d in days:
         date = d.get("nowDate")
         if dates and date not in dates:
             continue
-        st = day_status(d, by2.get(date))
-        out.append({
-            "date": date,
-            "label": fmt_date(date),
-            "status": st,
-            "mark": MARK[st],
-            "slots": free_slots(d, t_from, t_to),
-        })
+        starts = free_starts(d, t_from, t_to)
+        status = {"0": "holiday", "2": "close"}.get(d.get("openStatus"), "open" if starts else "full")
+        out.append({"date": date, "label": fmt_date(date), "status": status,
+                    "starts": starts, "times": group_starts(starts)})
     return out
 
 

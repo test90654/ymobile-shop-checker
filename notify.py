@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 定期チェック（GitHub Actions から実行）
-config.json の条件で空き状況を確認し、新しく空いた枠を Discord に通知する。
+config.json の条件（来店目的・店舗・日付・時間帯）で予約できる開始時刻を調べ、
+新しく空いた時刻を Discord に通知する。
 
-  python notify.py            # 通常（新しい空きだけ通知）
+  python notify.py            # 通常（新しく空いた時刻だけ通知）
   python notify.py --test     # 今の空きをそのまま通知（動作確認用）
   python notify.py --diagnose # 接続テスト（通知しない・state を変えない）
 """
@@ -56,6 +57,11 @@ def discord(text):
         urllib.request.urlopen(req, timeout=15).read()
 
 
+def purpose_of(cfg):
+    p = str(cfg.get("purpose") or ym.DEFAULT_PURPOSE)
+    return p if p in ym.PURPOSES else ym.DEFAULT_PURPOSE
+
+
 def select_shops(cfg):
     shops = ym.fetch_shops(cfg.get("lat", 36.2494035), cfg.get("lon", 139.1804534))
     wanted = [str(w).lower() for w in cfg.get("shops") or []]
@@ -66,15 +72,16 @@ def select_shops(cfg):
 
 
 def collect(cfg):
-    """{ "店コード|日付": ["1000-1045", ...] } と店舗情報を返す"""
+    """{ "店コード|日付": ["HHMM", ...] }（予約できる開始時刻）と店舗一覧・エラー"""
     dates = [ym.norm_date(d) for d in cfg.get("dates") or []] or None
     weekdays = set(cfg.get("weekdays") or [])  # 例: ["土", "日"]
     t_from, t_to = ym.norm_time(cfg.get("time_from")), ym.norm_time(cfg.get("time_to"))
+    purpose = purpose_of(cfg)
     shops = select_shops(cfg)
     found, errors = {}, []
     for s in shops:
         try:
-            cal = ym.shop_calendar(s["code"], t_from, t_to, dates)
+            cal = ym.shop_calendar(s["code"], purpose, t_from, t_to, dates)
         except ym.FetchError as e:
             errors.append(f'{s["name"]}: {e}')
             continue
@@ -84,33 +91,39 @@ def collect(cfg):
         for day in cal:
             if weekdays and day["label"][-2] not in weekdays:
                 continue
-            if day["slots"]:
-                found[f'{s["code"]}|{day["date"]}'] = [f"{a}-{b}" for a, b in day["slots"]]
+            if day["starts"]:
+                found[f'{s["code"]}|{day["date"]}'] = day["starts"]
     return shops, found, errors
 
 
-def blocks_of(ranges):
-    """["1000-1045"] → {"1000","1015","1030"}（15分枠の開始時刻の集合）"""
-    out = set()
-    for r in ranges:
-        a, b = r.split("-")
-        m, end = int(a[:2]) * 60 + int(a[2:]), int(b[:2]) * 60 + int(b[2:])
-        while m < end:
-            out.add(f"{m // 60:02d}{m % 60:02d}")
-            m += 15
-    return out
-
-
-def message(title, items, shops):
+def message(title, items, shops, purpose):
     names = {s["code"]: s for s in shops}
-    lines = [f"📱 **ワイモバイル来店予約：{title}**"]
+    lines = [f"📱 **ワイモバイル来店予約：{title}**", f"来店目的：{ym.PURPOSES[purpose]}"]
     for key in sorted(items, key=lambda k: (k.split("|")[1], k)):
         code, date = key.split("|")
-        times = [ym.hhmm(t[:4]) + "-" + ym.hhmm(t[5:]) for t in items[key]]
-        more = f" ほか{len(times) - 8}枠" if len(times) > 8 else ""
+        times = ym.group_starts(items[key])
         shop = names.get(code, {"name": code, "url": f"{ym.BASE}/shop/detail/{code}/"})
-        lines.append(f"**{ym.fmt_date(date)}** {shop['name']}\n　{' / '.join(times[:8])}{more}\n　<{shop['url']}>")
+        lines.append(f"**{ym.fmt_date(date)}** {shop['name']}\n　{' / '.join(times)}\n　<{shop['url']}>")
     return "\n".join(lines)
+
+
+def diagnose(cfg):
+    # ::notice:: は Actions の実行結果画面に注釈として表示される
+    purpose = purpose_of(cfg)
+    try:
+        shops = ym.fetch_shops(cfg.get("lat", 36.2494035), cfg.get("lon", 139.1804534))
+    except ym.FetchError as e:
+        print(f"::error title=店舗一覧::取得失敗 {e}")
+        sys.exit(1)
+    print(f"::notice title=店舗一覧::OK {len(shops)}件 / 目的 {purpose} {ym.PURPOSES[purpose]}")
+    for s in shops[:2]:
+        try:
+            cal = ym.shop_calendar(s["code"], purpose) or []
+        except ym.FetchError as e:
+            print(f'::notice title={s["code"]}::失敗 {e}')
+            continue
+        for d in cal[:4]:
+            print(f'::notice title={s["code"]} {d["label"]}::{" ".join(d["times"]) or "なし"}')
 
 
 def main():
@@ -120,37 +133,18 @@ def main():
     args = ap.parse_args()
 
     cfg = load(CONFIG, {})
+    if args.diagnose:
+        diagnose(cfg)
+        return
+
     state = load(STATE, {})
     now = dt.datetime.now(JST).strftime("%Y-%m-%d %H:%M")
-
-    if args.diagnose:
-        # ::notice:: は Actions の実行結果画面に注釈として表示される
-        try:
-            shops = ym.fetch_shops(cfg.get("lat", 36.2494035), cfg.get("lon", 139.1804534))
-        except ym.FetchError as e:
-            print(f"::error title=店舗一覧::取得失敗 {e}")
-            sys.exit(1)
-        print(f"::notice title=店舗一覧::OK {len(shops)}件")
-        for s in shops[:3]:
-            try:
-                cal = ym.shop_calendar(s["code"])
-                res = "データなし" if cal is None else " ".join(d["label"] + d["mark"] for d in cal[:7])
-            except ym.FetchError as e:
-                res = f"失敗 {e}"
-            print(f'::notice title={s["code"]}::{s["name"]} {res}')
-        # 1店舗目の各日の空き時間
-        if shops:
-            cal = ym.shop_calendar(shops[0]["code"]) or []
-            for d in cal:
-                t = " ".join(f"{ym.hhmm(a)}-{ym.hhmm(b)}" for a, b in d["slots"]) or "なし"
-                print(f'::notice title={shops[0]["code"]} {d["label"]}::{t}')
-        return
+    purpose = purpose_of(cfg)
 
     try:
         shops, found, errors = collect(cfg)
     except ym.FetchError as e:
         shops, found, errors = [], None, [f"店舗一覧: {e}"]
-
     for e in errors:
         print("⚠", e)
 
@@ -160,24 +154,27 @@ def main():
             discord("⚠️ ワイモバイルの空き状況を取得できない状態が続いています。\n" + "\n".join(errors[:5]))
         save_state(state)
         print(f"[{now}] 取得失敗（連続{state['fail_count']}回）")
-        sys.exit(0)
+        return
 
-    prev = state.get("slots", {})
+    # 来店目的を変えたら前回の状態はリセット（全部が「新しい空き」扱いにならないよう、その回は通知しない）
+    prev = state.get("slots", {}) if state.get("purpose") == purpose else None
+
     if args.test:
-        discord(message("現在の空き（テスト送信）", found, shops) if found
-                else "📱 ワイモバイル来店予約：条件に合う空きは今ありません（テスト送信）")
-    else:
+        discord(message("現在の空き（テスト送信）", found, shops, purpose) if found
+                else f"📱 ワイモバイル来店予約：条件に合う空きは今ありません（{ym.PURPOSES[purpose]}・テスト送信）")
+    elif prev is not None:
         new = {}
-        for key, slots in found.items():
-            old = blocks_of(prev.get(key, []))
-            fresh = [t for t in slots if blocks_of([t]) - old]
+        for key, starts in found.items():
+            fresh = [t for t in starts if t not in set(prev.get(key, []))]
             if fresh:
                 new[key] = fresh
         if new:
-            discord(message("新しく空きが出ました", new, shops))
+            discord(message("新しく空きが出ました", new, shops, purpose))
         print(f"[{now}] 空きあり {len(found)}件 / 新規 {len(new)}件")
+    else:
+        print(f"[{now}] 初回（または目的変更）なので状態だけ保存: 空きあり {len(found)}件")
 
-    state.update({"slots": found, "fail_count": 0, "last_ok": now})
+    state.update({"slots": found, "purpose": purpose, "fail_count": 0, "last_ok": now})
     save_state(state)
 
 

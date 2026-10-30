@@ -49,7 +49,9 @@ def dist_km(lat1, lon1, lat2, lon2):
 @app.get("/")
 def index():
     cfg = config()
-    return render_template_string(PAGE, lat=cfg.get("lat", 36.2494035), lon=cfg.get("lon", 139.1804534))
+    purpose = cfg.get("purpose") if cfg.get("purpose") in ym.PURPOSES else ym.DEFAULT_PURPOSE
+    return render_template_string(PAGE, lat=cfg.get("lat", 36.2494035), lon=cfg.get("lon", 139.1804534),
+                                  purposes=ym.PURPOSES, purpose=purpose)
 
 
 @app.get("/api/shops")
@@ -73,14 +75,15 @@ def api_shops():
 def api_shop(code):
     if not code.isalnum() or len(code) > 12:
         return jsonify(error="店舗コードが不正です"), 400
+    purpose = request.args.get("purpose", ym.DEFAULT_PURPOSE)
+    if purpose not in ym.PURPOSES:
+        return jsonify(error="来店目的が不正です"), 400
     try:
-        cal = cached(f"cal:{code}", lambda: ym.shop_calendar(code))
+        cal = cached(f"cal:{code}:{purpose}", lambda: ym.shop_calendar(code, purpose))
     except ym.FetchError as e:
         return jsonify(error=f"取得できませんでした（{e}）"), 502
     if cal is None:
         return jsonify(error="この店舗は空き状況を公開していません"), 404
-    for d in cal:
-        d["slots"] = [f"{ym.hhmm(a)}-{ym.hhmm(b)}" for a, b in d["slots"]]
     return jsonify(days=cal, checked=time.strftime("%H:%M", time.localtime()))
 
 
@@ -119,7 +122,10 @@ button{font:inherit;border:0;border-radius:10px;padding:9px 12px;cursor:pointer}
 .bar button{background:rgba(255,255,255,.16);color:inherit;flex:1}
 @media (prefers-color-scheme: dark){.bar button{background:rgba(0,0,0,.14)}}
 main{padding:12px 16px 40px;max-width:640px;margin:0 auto}
-.legend{display:flex;flex-wrap:wrap;gap:10px;font-size:12px;color:var(--sub);margin:4px 0 12px}
+.purpose{display:block;font-size:12.5px;color:var(--sub);margin:2px 0 8px}
+.purpose select{display:block;width:100%;margin-top:4px;font:inherit;font-size:16px;color:var(--ink);
+  background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+.legend{font-size:12px;color:var(--sub);margin:4px 0 12px}
 
 .status{font-size:13px;color:var(--sub);margin:6px 0 10px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:12px}
@@ -154,12 +160,20 @@ main{padding:12px 16px 40px;max-width:640px;margin:0 auto}
   </div>
 </header>
 <main>
-  <div class="legend">緑の時間帯がWeb来店予約で空いている時間です（2週間分）</div>
+  <label class="purpose">来店目的
+    <select id="purpose">
+      {% for k, v in purposes.items() %}<option value="{{ k }}"{% if k == purpose %} selected{% endif %}>{{ v }}</option>{% endfor %}
+    </select>
+  </label>
+  <div class="legend">緑の時刻が、Web来店予約で<b>予約できる開始時刻</b>です（2週間分）</div>
   <div class="status" id="status">読み込み中…</div>
   <div id="list"></div>
 </main>
 <script>
 const HOME = {lat: {{ lat }}, lon: {{ lon }}};
+const sel = document.getElementById("purpose");
+try{ const p = localStorage.getItem("purpose"); if (p && [...sel.options].some(o=>o.value===p)) sel.value = p; }catch(e){}
+sel.onchange = () => { try{ localStorage.setItem("purpose", sel.value); }catch(e){} load(); };
 let where = HOME;
 const $ = s => document.querySelector(s);
 const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
@@ -201,17 +215,17 @@ function renderShop(s){
 
 async function fillShop(s, body){
   let data;
-  try { data = await getJSON(`/api/shop/${encodeURIComponent(s.code)}`); }
+  try { data = await getJSON(`/api/shop/${encodeURIComponent(s.code)}?purpose=${encodeURIComponent(sel.value)}`); }
   catch(e){ body.innerHTML = ""; body.append(el("div","err", e.message)); return; }
   body.innerHTML = "";
   const list = el("div","days");
   data.days.forEach(d => {
-    const row = el("div","row" + (d.slots.length ? "" : " none"));
+    const row = el("div","row" + (d.times.length ? "" : " none"));
     const lab = el("div","date " + (/\(土\)/.test(d.label) ? "sat" : /\(日\)/.test(d.label) ? "sun" : ""), d.label);
     const times = el("div","times");
-    if (d.slots.length) d.slots.forEach(t => times.append(el("span","chip", t)));
+    if (d.times.length) d.times.forEach(t => times.append(el("span","chip", t)));
     else times.append(el("span","nochip",
-      d.status==="holiday" ? "定休日" : d.status==="close" ? "受付終了" : "空きなし（電話で確認）"));
+      d.status==="holiday" ? "定休日" : d.status==="close" ? "受付終了" : "Webの空きなし（電話で確認）"));
     row.append(lab, times); list.append(row);
   });
   body.append(list);
