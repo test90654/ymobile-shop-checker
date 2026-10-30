@@ -244,7 +244,8 @@ main{padding:10px 16px 40px;max-width:640px;margin:0 auto}
 .chip{background:var(--okbg);color:var(--ok);border-radius:8px;padding:2px 8px;font-size:14px;font-weight:600;font-variant-numeric:tabular-nums}
 .none{color:var(--off);font-size:13px;padding-top:2px}
 .acts{display:flex;gap:8px;margin-top:10px}
-.acts a{flex:1;text-align:center;text-decoration:none;border-radius:10px;padding:8px;font-size:14px}
+.acts a{flex:1 1 0;text-align:center;text-decoration:none;border-radius:10px;padding:8px;font-size:14px}
+.acts a.wide{flex:2 1 0}
 .primary{background:var(--accent);color:var(--on-accent)}
 .ghost{border:1px solid var(--line);color:var(--ink)}
 .empty{text-align:center;color:var(--sub);padding:28px 0;font-size:14px}
@@ -413,6 +414,12 @@ function render(){
   rows.slice(0, 150).forEach(x => list.append(card(x.s, x.km)));
 }
 
+function mapUrl(s){
+  // 住所があれば「店名 住所」で検索（店舗ページが出やすい）、なければ緯度経度
+  const q = s.address ? `${s.name.replace(/［.*?］/g, "")} ${s.address}` : (s.lat != null ? `${s.lat},${s.lon}` : s.name);
+  return "https://www.google.com/maps/search/?api=1&query=" + encodeURIComponent(q);
+}
+
 function card(s, dist){
   const c = el("div","card");
   c.append(el("h2", null, s.name));
@@ -436,9 +443,10 @@ function card(s, dist){
   }
   c.append(box);
   const a = el("div","acts");
-  const a1 = el("a","primary","Webで予約"); a1.href = s.url; a1.target = "_blank"; a1.rel = "noopener";
-  const a2 = el("a","ghost","電話する"); a2.href = "tel:" + (s.tel || "").replace(/[^0-9]/g,"");
-  a.append(a1, a2); c.append(a);
+  const a1 = el("a","primary wide","Webで予約"); a1.href = s.url; a1.target = "_blank"; a1.rel = "noopener";
+  const a2 = el("a","ghost","電話"); a2.href = "tel:" + (s.tel || "").replace(/[^0-9]/g,"");
+  const a3 = el("a","ghost","地図"); a3.href = mapUrl(s); a3.target = "_blank"; a3.rel = "noopener";
+  a.append(a1, a3, a2); c.append(a);
   return c;
 }
 

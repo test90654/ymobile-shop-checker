@@ -42,7 +42,7 @@ def one(shop, purpose):
 def build(pref, purpose):
     t0 = time.time()
     shops = [s for s in ym.fetch_pref_shops(pref) if s["reservable"]]
-    keep = ("code", "name", "city", "tel", "hours", "url", "notice", "lat", "lon")
+    keep = ("code", "name", "city", "address", "tel", "hours", "url", "notice", "lat", "lon")
     with ThreadPoolExecutor(WORKERS) as ex:
         results = list(ex.map(lambda s: one(s, purpose), shops))
     rows = [dict({k: s.get(k) for k in keep}, **r) for s, r in zip(shops, results)]
