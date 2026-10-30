@@ -124,12 +124,20 @@ def main():
     now = dt.datetime.now(JST).strftime("%Y-%m-%d %H:%M")
 
     if args.diagnose:
-        shops = ym.fetch_shops(cfg.get("lat", 36.2494035), cfg.get("lon", 139.1804534))
-        print(f"店舗一覧: OK（{len(shops)}件）")
+        # ::notice:: は Actions の実行結果画面に注釈として表示される
+        try:
+            shops = ym.fetch_shops(cfg.get("lat", 36.2494035), cfg.get("lon", 139.1804534))
+        except ym.FetchError as e:
+            print(f"::error title=店舗一覧::取得失敗 {e}")
+            sys.exit(1)
+        print(f"::notice title=店舗一覧::OK {len(shops)}件")
         for s in shops[:3]:
-            cal = ym.shop_calendar(s["code"])
-            print(f'  {s["name"]} [{s["code"]}]:',
-                  "取得失敗" if cal is None else " ".join(d["label"] + d["mark"] for d in cal[:7]))
+            try:
+                cal = ym.shop_calendar(s["code"])
+                res = "データなし" if cal is None else " ".join(d["label"] + d["mark"] for d in cal[:7])
+            except ym.FetchError as e:
+                res = f"失敗 {e}"
+            print(f'::notice title={s["code"]}::{s["name"]} {res}')
         return
 
     try:
