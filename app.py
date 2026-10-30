@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
-"""スマホ用の空き状況ビューア（Render で動かす Web アプリ）"""
+"""スマホ用の空き状況ビューア（Render で動かす Web アプリ）
+
+都道府県を選ぶと県内の全店舗の空きをまとめて調べ、空きのある店舗だけを早い順に表示する。
+"""
 
 import json
 import math
@@ -25,6 +28,9 @@ def cached(key, fn):
     val = fn()
     with _lock:
         _cache[key] = (time.time(), val)
+        if len(_cache) > 2000:  # 古いものを掃除
+            for k in sorted(_cache, key=lambda k: _cache[k][0])[:500]:
+                _cache.pop(k, None)
     return val
 
 
@@ -49,26 +55,37 @@ def dist_km(lat1, lon1, lat2, lon2):
 @app.get("/")
 def index():
     cfg = config()
-    purpose = cfg.get("purpose") if cfg.get("purpose") in ym.PURPOSES else ym.DEFAULT_PURPOSE
-    return render_template_string(PAGE, lat=cfg.get("lat", 36.2494035), lon=cfg.get("lon", 139.1804534),
-                                  purposes=ym.PURPOSES, purpose=purpose)
+    pref = cfg.get("prefecture") if cfg.get("prefecture") in ym.PREFS else "埼玉県"
+    return render_template_string(
+        PAGE, lat=cfg.get("lat", 36.2494035), lon=cfg.get("lon", 139.1804534),
+        purposes={k: v[0] for k, v in ym.PURPOSES.items()},
+        purpose=ym.norm_purpose(cfg.get("purpose")), prefs=ym.PREFS, pref=pref)
 
 
 @app.get("/api/shops")
 def api_shops():
+    pref = request.args.get("pref")
     lat = request.args.get("lat", type=float)
     lon = request.args.get("lon", type=float)
-    if lat is None or lon is None:
-        return jsonify(error="lat/lon が必要です"), 400
-    key = f"shops:{lat:.4f},{lon:.4f}"
     try:
-        shops = cached(key, lambda: ym.fetch_shops(lat, lon))
+        if pref:
+            if pref not in ym.PREFS:
+                return jsonify(error="都道府県名が不正です"), 400
+            shops = cached(f"pref:{pref}", lambda: ym.fetch_pref_shops(pref))
+        elif lat is not None and lon is not None:
+            shops = cached(f"near:{lat:.4f},{lon:.4f}", lambda: ym.fetch_shops(lat, lon))
+        else:
+            return jsonify(error="pref か lat/lon が必要です"), 400
     except ym.FetchError as e:
         return jsonify(error=f"店舗一覧を取得できませんでした（{e}）"), 502
+    out = []
     for s in shops:
-        d = dist_km(lat, lon, s.get("lat"), s.get("lon"))
-        s["km"] = round(d, 1) if d is not None else None
-    return jsonify(shops=shops)
+        s = dict(s)
+        if lat is not None and lon is not None:
+            d = dist_km(lat, lon, s.get("lat"), s.get("lon"))
+            s["km"] = round(d, 1) if d is not None else None
+        out.append(s)
+    return jsonify(shops=out)
 
 
 @app.get("/api/shop/<code>")
@@ -83,8 +100,8 @@ def api_shop(code):
     except ym.FetchError as e:
         return jsonify(error=f"取得できませんでした（{e}）"), 502
     if cal is None:
-        return jsonify(error="この店舗は空き状況を公開していません"), 404
-    return jsonify(days=cal, checked=time.strftime("%H:%M", time.localtime()))
+        return jsonify(days=None)  # この目的は受け付けていない店舗
+    return jsonify(days=cal)
 
 
 @app.get("/healthz")
@@ -102,146 +119,237 @@ PAGE = r"""<!doctype html>
 <style>
 :root{
   --bg:#f4f5f7; --card:#fff; --ink:#15181d; --sub:#5d6470; --line:#e3e6ea;
-  --accent:#0b1f3a; --ok:#0a7d4f; --okbg:#e3f5ec; --few:#9a6200; --fewbg:#fdf1d8;
-  --tel:#3b5bdb; --telbg:#e8edff; --off:#9aa1ab; --offbg:#eef0f2;
+  --accent:#0b1f3a; --on-accent:#fff; --ok:#0a7d4f; --okbg:#e3f5ec; --off:#9aa1ab; --offbg:#eef0f2;
+  --sat:#3b5bdb; --sun:#c92a2a; --bar:#0a7d4f;
 }
 @media (prefers-color-scheme: dark){:root{
   --bg:#0f1114; --card:#1a1d22; --ink:#eef0f3; --sub:#9aa2ad; --line:#2a2e35;
-  --accent:#8fb4ff; --ok:#5fd6a0; --okbg:#15322a; --few:#f0b74f; --fewbg:#3a2e14;
-  --tel:#9db1ff; --telbg:#1e2742; --off:#6b727c; --offbg:#22262c;
+  --accent:#8fb4ff; --on-accent:#0f1114; --ok:#5fd6a0; --okbg:#15322a; --off:#6b727c; --offbg:#22262c;
+  --sat:#9db1ff; --sun:#ff8787; --bar:#5fd6a0;
 }}
 *{box-sizing:border-box}
+[hidden]{display:none!important}
 body{margin:0;background:var(--bg);color:var(--ink);
   font:15px/1.5 -apple-system,BlinkMacSystemFont,"Hiragino Sans","Noto Sans JP",sans-serif;
-  padding:0 0 env(safe-area-inset-bottom)}
-header{position:sticky;top:0;z-index:5;background:var(--accent);color:#fff;padding:14px 16px 12px}
-@media (prefers-color-scheme: dark){header{color:#0f1114}}
-h1{margin:0;font-size:18px;letter-spacing:.02em}
-.bar{display:flex;gap:8px;margin-top:10px}
-button{font:inherit;border:0;border-radius:10px;padding:9px 12px;cursor:pointer}
-.bar button{background:rgba(255,255,255,.16);color:inherit;flex:1}
-@media (prefers-color-scheme: dark){.bar button{background:rgba(0,0,0,.14)}}
+  padding-bottom:env(safe-area-inset-bottom)}
+header{background:var(--accent);color:var(--on-accent);padding:14px 16px 14px}
+h1{margin:0 0 10px;font-size:18px}
+.seg{display:flex;background:rgba(255,255,255,.14);border-radius:10px;padding:3px;margin-bottom:10px}
+@media (prefers-color-scheme: dark){.seg{background:rgba(0,0,0,.14)}}
+.seg button{flex:1;font:inherit;font-size:14px;border:0;border-radius:8px;padding:7px;background:none;color:inherit;cursor:pointer}
+.seg button.on{background:var(--card);color:var(--ink);font-weight:600}
+select,input{display:block;width:100%;font:inherit;font-size:16px;color:var(--ink);background:var(--card);
+  border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+label{display:block;font-size:12px;opacity:.85;margin:8px 0 4px}
+.row2{display:flex;gap:8px}.row2>*{flex:1;min-width:0}
+.go{display:block;width:100%;margin-top:12px;font:inherit;font-weight:700;border:0;border-radius:10px;padding:11px;
+  background:var(--card);color:var(--ink);cursor:pointer}
 main{padding:12px 16px 40px;max-width:640px;margin:0 auto}
-.purpose{display:block;font-size:12.5px;color:var(--sub);margin:2px 0 8px}
-.purpose select{display:block;width:100%;margin-top:4px;font:inherit;font-size:16px;color:var(--ink);
-  background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
-.legend{font-size:12px;color:var(--sub);margin:4px 0 12px}
-
-.status{font-size:13px;color:var(--sub);margin:6px 0 10px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:12px}
-.card h2{font-size:16px;margin:0 0 2px}
+.prog{position:sticky;top:0;z-index:4;background:var(--bg);padding:8px 0 8px}
+.ptext{font-size:13px;color:var(--sub)}
+.pbar{height:4px;background:var(--offbg);border-radius:4px;overflow:hidden;margin-top:6px}
+.pbar i{display:block;height:100%;width:0;background:var(--bar);transition:width .2s}
+.dates{display:flex;gap:6px;overflow-x:auto;padding:8px 0 4px;margin:0 -16px;padding-left:16px;padding-right:16px;scrollbar-width:none}
+.dates::-webkit-scrollbar{display:none}
+.dchip{flex:0 0 auto;font:inherit;font-size:13px;border:1px solid var(--line);background:var(--card);color:var(--ink);
+  border-radius:20px;padding:5px 11px;cursor:pointer;white-space:nowrap}
+.dchip.on{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+.dchip .n{font-size:11px;opacity:.7;margin-left:3px}
+.dchip.zero{color:var(--off)}
+.opts{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--sub);margin:6px 0 10px}
+.opts input{width:auto;display:inline}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:13px 14px;margin-bottom:10px}
+.card h2{font-size:15.5px;margin:0}
 .meta{font-size:12.5px;color:var(--sub)}
-.notice{font-size:12.5px;color:var(--few);margin-top:4px}
-.days{margin-top:10px;border-top:1px solid var(--line)}
-.row{display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-bottom:1px solid var(--line)}
-.date{flex:0 0 64px;font-weight:600;font-size:14px;padding-top:3px;font-variant-numeric:tabular-nums}
-.date.sat{color:var(--tel)} .date.sun{color:#c92a2a}
-.times{flex:1;display:flex;flex-wrap:wrap;gap:5px}
-.chip{background:var(--okbg);color:var(--ok);border-radius:8px;padding:3px 8px;font-size:14px;font-weight:600;font-variant-numeric:tabular-nums}
-.nochip{color:var(--off);font-size:13px;padding-top:3px}
-.row.none .date{color:var(--off)}
-.actions{display:flex;gap:8px;margin-top:12px}
-.actions a{flex:1;text-align:center;text-decoration:none;border-radius:10px;padding:9px;font-size:14px}
-.primary{background:var(--accent);color:#fff}
-@media (prefers-color-scheme: dark){.primary{color:#0f1114}}
+.notice{font-size:12px;color:#b26b00;margin-top:2px}
+.days{margin-top:8px}
+.d{display:flex;gap:10px;align-items:flex-start;padding:6px 0;border-top:1px solid var(--line)}
+.dl{flex:0 0 66px;font-weight:600;font-size:14px;padding-top:2px;font-variant-numeric:tabular-nums}
+.dl.sat{color:var(--sat)} .dl.sun{color:var(--sun)}
+.ts{flex:1;display:flex;flex-wrap:wrap;gap:5px}
+.chip{background:var(--okbg);color:var(--ok);border-radius:8px;padding:2px 8px;font-size:14px;font-weight:600;font-variant-numeric:tabular-nums}
+.none{color:var(--off);font-size:13px;padding-top:2px}
+.acts{display:flex;gap:8px;margin-top:10px}
+.acts a{flex:1;text-align:center;text-decoration:none;border-radius:10px;padding:8px;font-size:14px}
+.primary{background:var(--accent);color:var(--on-accent)}
 .ghost{border:1px solid var(--line);color:var(--ink)}
-.err{color:#c92a2a;font-size:13px;margin-top:8px}
-.skel{height:52px;border-radius:9px;background:var(--offbg);margin-top:12px;animation:p 1.2s infinite}
-@keyframes p{50%{opacity:.5}}
+.empty{text-align:center;color:var(--sub);padding:28px 0;font-size:14px}
+.err{color:var(--sun);font-size:13px}
 </style>
 </head>
 <body>
 <header>
   <h1>ワイモバイル 来店予約の空き</h1>
-  <div class="bar">
-    <button id="here">📍 現在地</button>
-    <button id="home">🏠 いつもの</button>
-    <button id="reload">↻ 更新</button>
+  <div class="seg" id="mode">
+    <button data-m="pref">都道府県でまとめて</button>
+    <button data-m="near">現在地の近く</button>
   </div>
+  <div id="prefBox" class="row2">
+    <div><label for="pref">都道府県</label>
+      <select id="pref">{% for p in prefs %}<option{% if p == pref %} selected{% endif %}>{{ p }}</option>{% endfor %}</select></div>
+    <div><label for="city">市区町村で絞る（任意）</label>
+      <input id="city" placeholder="例: 本庄 / さいたま" autocomplete="off"></div>
+  </div>
+  <label for="purpose">来店目的</label>
+  <select id="purpose">{% for k, v in purposes.items() %}<option value="{{ k }}"{% if k == purpose %} selected{% endif %}>{{ v }}</option>{% endfor %}</select>
+  <button class="go" id="go">この条件で探す</button>
 </header>
 <main>
-  <label class="purpose">来店目的
-    <select id="purpose">
-      {% for k, v in purposes.items() %}<option value="{{ k }}"{% if k == purpose %} selected{% endif %}>{{ v }}</option>{% endfor %}
-    </select>
-  </label>
-  <div class="legend">緑の時刻が、Web来店予約で<b>予約できる開始時刻</b>です（2週間分）</div>
-  <div class="status" id="status">読み込み中…</div>
-  <div id="list"></div>
+  <div class="prog" id="prog" hidden>
+    <div class="ptext" id="ptext"></div>
+    <div class="pbar"><i id="pbar"></i></div>
+    <div class="dates" id="dates"></div>
+  </div>
+  <div class="opts" id="opts" hidden><label style="margin:0;opacity:1;display:flex;gap:6px;align-items:center">
+    <input type="checkbox" id="showAll"> 空きのない店舗も表示</label></div>
+  <div id="list"><div class="empty">条件を選んで「この条件で探す」を押してください</div></div>
 </main>
 <script>
 const HOME = {lat: {{ lat }}, lon: {{ lon }}};
-const sel = document.getElementById("purpose");
-try{ const p = localStorage.getItem("purpose"); if (p && [...sel.options].some(o=>o.value===p)) sel.value = p; }catch(e){}
-sel.onchange = () => { try{ localStorage.setItem("purpose", sel.value); }catch(e){} load(); };
-let where = HOME;
+const PARALLEL = 3;
 const $ = s => document.querySelector(s);
 const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+const store = { get(k){ try{ return localStorage.getItem(k); }catch(e){ return null; } }, set(k,v){ try{ localStorage.setItem(k,v); }catch(e){} } };
 
-function remember(p){ try{ localStorage.setItem("where", JSON.stringify(p)); }catch(e){} }
-try{ const s = JSON.parse(localStorage.getItem("where")||"null"); if (s && s.lat) where = s; }catch(e){}
+let mode = store.get("mode") || "pref";
+let run = 0;            // 条件を変えたら古い検索結果を捨てるための番号
+let results = [];       // [{shop, days, err}]
+let dateSel = "all";
+
+for (const id of ["pref","purpose","city"]) { const v = store.get(id); if (v != null && v !== "") { const e = $("#"+id); if (e.tagName !== "SELECT" || [...e.options].some(o=>o.value===v)) e.value = v; } }
+function setMode(m){ mode = m; store.set("mode", m);
+  document.querySelectorAll("#mode button").forEach(b => b.classList.toggle("on", b.dataset.m === m));
+  $("#prefBox").style.display = m === "pref" ? "" : "none"; }
+document.querySelectorAll("#mode button").forEach(b => b.onclick = () => setMode(b.dataset.m));
+setMode(mode);
 
 async function getJSON(url){
-  const r = await fetch(url); const j = await r.json().catch(()=>({error:"応答を読めませんでした"}));
+  const r = await fetch(url); const j = await r.json().catch(()=>({error:"応答を読めませんでした（サーバー起動中かもしれません）"}));
   if (!r.ok) throw new Error(j.error || r.status); return j;
 }
-
-async function load(){
-  $("#status").textContent = "店舗を探しています…（初回は起動に30秒ほどかかることがあります）";
-  $("#list").innerHTML = "";
-  let data;
-  try { data = await getJSON(`/api/shops?lat=${where.lat}&lon=${where.lon}`); }
-  catch(e){ $("#status").textContent = "⚠ " + e.message; return; }
-  const shops = data.shops.filter(s => s.reservable);
-  $("#status").textContent = `近い順に ${shops.length} 店舗`;
-  // 店ごとに順番に取得（サイトへの負荷を抑える）
-  const cards = shops.map(renderShop);
-  for (const [i, s] of shops.entries()) await fillShop(s, cards[i]);
-}
-
-function renderShop(s){
-  const c = el("div","card");
-  c.append(el("h2", null, s.name));
-  c.append(el("div","meta", [s.km!=null ? `${s.km}km` : "", s.hours, s.tel].filter(Boolean).join("・")));
-  if (s.notice) c.append(el("div","notice","臨時情報：" + s.notice));
-  const body = el("div"); body.append(el("div","skel")); c.append(body);
-  const act = el("div","actions");
-  const a1 = el("a","primary","Webで予約"); a1.href = s.url; a1.target = "_blank";
-  const a2 = el("a","ghost","電話する"); a2.href = "tel:" + s.tel.replace(/[^0-9]/g,"");
-  act.append(a1, a2); c.append(act);
-  $("#list").append(c);
-  return body;
-}
-
-async function fillShop(s, body){
-  let data;
-  try { data = await getJSON(`/api/shop/${encodeURIComponent(s.code)}?purpose=${encodeURIComponent(sel.value)}`); }
-  catch(e){ body.innerHTML = ""; body.append(el("div","err", e.message)); return; }
-  body.innerHTML = "";
-  const list = el("div","days");
-  data.days.forEach(d => {
-    const row = el("div","row" + (d.times.length ? "" : " none"));
-    const lab = el("div","date " + (/\(土\)/.test(d.label) ? "sat" : /\(日\)/.test(d.label) ? "sun" : ""), d.label);
-    const times = el("div","times");
-    if (d.times.length) d.times.forEach(t => times.append(el("span","chip", t)));
-    else times.append(el("span","nochip",
-      d.status==="holiday" ? "定休日" : d.status==="close" ? "受付終了" : "Webの空きなし（電話で確認）"));
-    row.append(lab, times); list.append(row);
+function position(){
+  return new Promise((ok, ng) => {
+    if (!navigator.geolocation) return ng(new Error("位置情報が使えません"));
+    navigator.geolocation.getCurrentPosition(p => ok({lat:p.coords.latitude, lon:p.coords.longitude}),
+      () => ng(new Error("現在地を取得できませんでした")), {timeout: 10000});
   });
-  body.append(list);
 }
 
-$("#here").onclick = () => {
-  if (!navigator.geolocation) return alert("位置情報が使えません");
-  $("#status").textContent = "現在地を取得中…";
-  navigator.geolocation.getCurrentPosition(
-    p => { where = {lat: p.coords.latitude, lon: p.coords.longitude}; remember(where); load(); },
-    () => { $("#status").textContent = "⚠ 現在地を取得できませんでした"; },
-    {enableHighAccuracy: false, timeout: 10000});
-};
-$("#home").onclick = () => { where = HOME; remember(where); load(); };
-$("#reload").onclick = load;
-load();
+$("#go").onclick = search;
+$("#showAll").onchange = render;
+
+async function search(){
+  const my = ++run;
+  ["pref","purpose","city"].forEach(id => store.set(id, $("#"+id).value));
+  results = []; dateSel = "all";
+  $("#list").innerHTML = ""; $("#prog").hidden = false; $("#opts").hidden = true; $("#dates").innerHTML = "";
+  setProg("店舗一覧を取得しています…（初回はサーバー起動に30秒ほどかかります）", 0);
+  let shops;
+  try {
+    if (mode === "pref") {
+      shops = (await getJSON(`/api/shops?pref=${encodeURIComponent($("#pref").value)}`)).shops;
+    } else {
+      setProg("現在地を取得しています…", 0);
+      let pos; try { pos = await position(); } catch(e) { pos = HOME; }
+      shops = (await getJSON(`/api/shops?lat=${pos.lat}&lon=${pos.lon}`)).shops;
+    }
+  } catch(e) { if (my === run) setProg("⚠ " + e.message, 0); return; }
+  if (my !== run) return;
+  const city = $("#city").value.trim();
+  shops = shops.filter(s => s.reservable && (mode !== "pref" || !city || (s.city + s.name).includes(city)));
+  if (!shops.length) { setProg("条件に合う店舗がありません", 1); return; }
+
+  const purpose = $("#purpose").value;
+  let done = 0, i = 0;
+  const worker = async () => {
+    while (i < shops.length && my === run) {
+      const s = shops[i++];
+      let days = null, err = null;
+      try { days = (await getJSON(`/api/shop/${encodeURIComponent(s.code)}?purpose=${purpose}`)).days; }
+      catch(e) { err = e.message; }
+      if (my !== run) return;
+      results.push({shop: s, days, err, order: shops.indexOf(s)});
+      done++;
+      setProg(progText(done, shops.length), done / shops.length);
+      render();
+    }
+  };
+  await Promise.all(Array.from({length: PARALLEL}, worker));
+  if (my === run) { setProg(progText(done, shops.length, true), 1); render(); }
+}
+
+function openCount(){ return results.filter(r => firstSlot(r) !== null).length; }
+function progText(done, total, fin){
+  const n = openCount();
+  return fin ? `${total}店舗を確認しました。空きがあるのは ${n}店舗`
+             : `${done} / ${total} 店舗を確認中… 空きあり ${n}店舗`;
+}
+function setProg(t, ratio){ $("#ptext").textContent = t; $("#pbar").style.width = Math.round(ratio*100) + "%"; }
+
+function daysOf(r){ return (r.days || []).filter(d => dateSel === "all" || d.date === dateSel); }
+function firstSlot(r){
+  for (const d of daysOf(r)) if (d.starts.length) return d.date + d.starts[0];
+  return null;
+}
+
+function renderDates(){
+  const box = $("#dates"); const all = new Map();
+  results.forEach(r => (r.days || []).forEach(d => {
+    if (!all.has(d.date)) all.set(d.date, {label: d.label, n: 0});
+    if (d.starts.length) all.get(d.date).n++;
+  }));
+  const keys = [...all.keys()].sort();
+  box.innerHTML = "";
+  const mk = (key, text, n) => {
+    const b = el("button", "dchip" + (dateSel === key ? " on" : "") + (n === 0 ? " zero" : ""), text);
+    if (n != null) b.append(el("span","n", n + "店"));
+    b.onclick = () => { dateSel = key; render(); };
+    box.append(b);
+  };
+  mk("all", "すべての日", null);
+  keys.forEach(k => mk(k, all.get(k).label, all.get(k).n));
+}
+
+function render(){
+  renderDates();
+  $("#opts").hidden = results.length === 0;
+  const showAll = $("#showAll").checked;
+  const list = $("#list"); list.innerHTML = "";
+  const rows = results
+    .map(r => ({r, key: firstSlot(r)}))
+    .filter(x => showAll || x.key !== null)
+    .sort((a, b) => (a.key === null) - (b.key === null) || (a.key || "").localeCompare(b.key || "") || a.r.order - b.r.order);
+  if (!rows.length) { list.append(el("div","empty", results.length ? "今のところ空きのある店舗はありません" : "")); return; }
+  rows.forEach(({r}) => list.append(card(r)));
+}
+
+function card(r){
+  const s = r.shop, c = el("div","card");
+  c.append(el("h2", null, s.name));
+  c.append(el("div","meta", [s.km != null ? s.km + "km" : "", s.city, s.hours].filter(Boolean).join("・")));
+  if (s.notice) c.append(el("div","notice","臨時情報：" + s.notice));
+  const box = el("div","days");
+  if (r.err) box.append(el("div","err", r.err));
+  else if (r.days === null) box.append(el("div","none", "この来店目的はWeb予約を受け付けていません"));
+  else {
+    const ds = daysOf(r).filter(d => d.starts.length || $("#showAll").checked);
+    if (!ds.length) box.append(el("div","none", "Webの空きなし（電話で確認）"));
+    ds.forEach(d => {
+      const row = el("div","d");
+      row.append(el("div", "dl" + (/土/.test(d.label) ? " sat" : /日\)/.test(d.label) ? " sun" : ""), d.label));
+      const ts = el("div","ts");
+      if (d.times.length) d.times.forEach(t => ts.append(el("span","chip", t)));
+      else ts.append(el("span","none", d.status === "holiday" ? "定休日" : "空きなし"));
+      row.append(ts); box.append(row);
+    });
+  }
+  c.append(box);
+  const a = el("div","acts");
+  const a1 = el("a","primary","Webで予約"); a1.href = s.url; a1.target = "_blank"; a1.rel = "noopener";
+  const a2 = el("a","ghost","電話する"); a2.href = "tel:" + (s.tel || "").replace(/[^0-9]/g,"");
+  a.append(a1, a2); c.append(a);
+  return c;
+}
 </script>
 </body>
 </html>

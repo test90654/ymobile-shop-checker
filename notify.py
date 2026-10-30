@@ -58,17 +58,32 @@ def discord(text):
 
 
 def purpose_of(cfg):
-    p = str(cfg.get("purpose") or ym.DEFAULT_PURPOSE)
-    return p if p in ym.PURPOSES else ym.DEFAULT_PURPOSE
+    return ym.norm_purpose(cfg.get("purpose"))
+
+
+def pname(purpose):
+    return ym.PURPOSES[purpose][0]
+
+
+def base_shops(cfg):
+    """prefecture があれば県内全店、なければ lat/lon から近い順"""
+    pref = cfg.get("prefecture")
+    if pref:
+        return ym.fetch_pref_shops(pref)
+    return ym.fetch_shops(cfg.get("lat", 36.2494035), cfg.get("lon", 139.1804534))
 
 
 def select_shops(cfg):
-    shops = ym.fetch_shops(cfg.get("lat", 36.2494035), cfg.get("lon", 139.1804534))
+    shops = [s for s in base_shops(cfg) if s["reservable"]]
+    cities = [str(c) for c in cfg.get("cities") or []]
+    if cities:
+        shops = [s for s in shops if any(c in s["city"] for c in cities)]
     wanted = [str(w).lower() for w in cfg.get("shops") or []]
     if wanted:
         shops = [s for s in shops
                  if any(w == s["code"].lower() or w in s["name"].lower() for w in wanted)]
-    return [s for s in shops if s["reservable"]][: int(cfg.get("max_shops", 5))]
+    limit = int(cfg.get("max_shops") or 0)
+    return shops[:limit] if limit and not cfg.get("prefecture") else shops
 
 
 def collect(cfg):
@@ -98,7 +113,7 @@ def collect(cfg):
 
 def message(title, items, shops, purpose):
     names = {s["code"]: s for s in shops}
-    lines = [f"📱 **ワイモバイル来店予約：{title}**", f"来店目的：{ym.PURPOSES[purpose]}"]
+    lines = [f"📱 **ワイモバイル来店予約：{title}**", f"来店目的：{pname(purpose)}"]
     for key in sorted(items, key=lambda k: (k.split("|")[1], k)):
         code, date = key.split("|")
         times = ym.group_starts(items[key])
@@ -111,12 +126,13 @@ def diagnose(cfg):
     # ::notice:: は Actions の実行結果画面に注釈として表示される
     purpose = purpose_of(cfg)
     try:
-        shops = ym.fetch_shops(cfg.get("lat", 36.2494035), cfg.get("lon", 139.1804534))
+        shops = select_shops(cfg)
     except ym.FetchError as e:
         print(f"::error title=店舗一覧::取得失敗 {e}")
         sys.exit(1)
-    print(f"::notice title=店舗一覧::OK {len(shops)}件 / 目的 {purpose} {ym.PURPOSES[purpose]}")
-    for s in shops[:2]:
+    area = cfg.get("prefecture") or "近く"
+    print(f"::notice title=店舗一覧::{area} OK {len(shops)}件 / 目的 {pname(purpose)}")
+    for s in shops[:3]:
         try:
             cal = ym.shop_calendar(s["code"], purpose) or []
         except ym.FetchError as e:
@@ -133,6 +149,8 @@ def main():
     args = ap.parse_args()
 
     cfg = load(CONFIG, {})
+    if os.environ.get("PREFECTURE_OVERRIDE"):  # Actions の手動実行で県を指定したとき
+        cfg["prefecture"] = os.environ["PREFECTURE_OVERRIDE"]
     if args.diagnose:
         diagnose(cfg)
         return
@@ -161,7 +179,7 @@ def main():
 
     if args.test:
         discord(message("現在の空き（テスト送信）", found, shops, purpose) if found
-                else f"📱 ワイモバイル来店予約：条件に合う空きは今ありません（{ym.PURPOSES[purpose]}・テスト送信）")
+                else f"📱 ワイモバイル来店予約：条件に合う空きは今ありません（{pname(purpose)}・テスト送信）")
     elif prev is not None:
         new = {}
         for key, starts in found.items():

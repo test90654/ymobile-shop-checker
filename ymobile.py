@@ -1,32 +1,43 @@
 # -*- coding: utf-8 -*-
-"""ワイモバイル店舗検索・来店予約空き状況の取得ロジック（Web画面と定期チェックで共用）"""
+"""ワイモバイル取扱店の検索と来店予約の空き状況（Web画面と定期チェックで共用）"""
 
 import datetime as dt
 import json
 import time
+import urllib.parse
 import urllib.request
 
 BASE = "https://www.ymobile.jp"
 
-# 来店目的（業務コード）。目的ごとに所要時間と空き枠が違う。
-# かんたん来店予約（visit-reservation.mb.softbank.jp）の getWorkInfo で確認したもの
+# 来店目的。目的ごとに所要時間と空き枠が違い、店の種類でコードも違う。
+#   key: (表示名, ソフトバンクショップ用コード, ワイモバイルショップ用コード)
+# かんたん来店予約（visit-reservation.mb.softbank.jp / visit-reservation.ymobile.jp）の
+# getWorkInfo で確認したもの
 PURPOSES = {
-    "I0": "MNP予約番号発行（他社へのお乗り換え）",
-    "20": "機種変更",
-    "K0": "他社⇒ワイモバイル（MNP）",
-    "J0": "ソフトバンク⇒ワイモバイル",
-    "E0": "ワイモバイル⇒ソフトバンク",
-    "30": "他社⇒ソフトバンク（MNP）",
-    "10": "新規契約",
-    "B0": "契約内容確認/変更",
-    "H0": "端末返却・下取り",
-    "60": "故障修理",
-    "80": "スマホ・ケータイの解約",
-    "N0": "店頭スマホサポート（データ移行）",
-    "L0": "店頭スマホサポート（データ移行以外）",
+    "mnp_out":  ("MNP予約番号発行（他社へのお乗り換え）", "I0", "KY"),
+    "change":   ("機種変更", "20", "2Y"),
+    "mnp_in":   ("他社⇒ワイモバイル（MNP）", "K0", "3Y"),
+    "sb_to_ym": ("ソフトバンク⇒ワイモバイル", "J0", "EY"),
+    "ym_to_sb": ("ワイモバイル⇒ソフトバンク", "E0", "LY"),
+    "new":      ("新規契約", "10", "1Y"),
+    "contract": ("契約内容確認/変更", "B0", "FY"),
+    "return":   ("端末返却・下取り", "H0", "JY"),
+    "repair":   ("故障修理", "60", "6Y"),
+    "cancel":   ("スマホ・ケータイの解約", "80", "7Y"),
+    "data":     ("店頭スマホサポート（データ移行）", "N0", "OY"),
+    "support":  ("店頭スマホサポート（データ移行以外）", "L0", "MY"),
 }
-DEFAULT_PURPOSE = "I0"
-FALLBACK_CODES = ["7Y"]  # ワイモバイル専売店で上の業務コードが使えない場合
+DEFAULT_PURPOSE = "mnp_out"
+# 以前の設定値（業務コード直書き）も受け付ける
+_LEGACY = {sb: k for k, (_, sb, _) in PURPOSES.items()}
+
+PREFS = ["北海道", "青森県", "岩手県", "宮城県", "秋田県", "山形県", "福島県",
+         "茨城県", "栃木県", "群馬県", "埼玉県", "千葉県", "東京都", "神奈川県",
+         "新潟県", "富山県", "石川県", "福井県", "山梨県", "長野県", "岐阜県",
+         "静岡県", "愛知県", "三重県", "滋賀県", "京都府", "大阪府", "兵庫県",
+         "奈良県", "和歌山県", "鳥取県", "島根県", "岡山県", "広島県", "山口県",
+         "徳島県", "香川県", "愛媛県", "高知県", "福岡県", "佐賀県", "長崎県",
+         "熊本県", "大分県", "宮崎県", "鹿児島県", "沖縄県"]
 
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 "
@@ -39,12 +50,18 @@ HEADERS = {
 }
 
 WEEK = "月火水木金土日"
-
-REQUEST_GAP_SEC = 0.8  # サイトに負荷をかけないための待ち時間
+REQUEST_GAP_SEC = 0.6  # サイトに負荷をかけないための待ち時間
 
 
 class FetchError(Exception):
     pass
+
+
+def norm_purpose(p):
+    p = str(p or "")
+    if p in PURPOSES:
+        return p
+    return _LEGACY.get(p, DEFAULT_PURPOSE)
 
 
 def post_json(path, referer):
@@ -63,27 +80,43 @@ def post_json(path, referer):
         raise FetchError(f"JSONではない応答（ブロックされた可能性）: {body[:120]!r}") from e
 
 
+def _shop(s):
+    code = s.get("shop_w_code") or (s.get("url") or "").rstrip("/").split("/")[-1]
+    if not code:
+        return None
+    return {
+        "code": code,
+        "name": s.get("shop_name", code),
+        "pref": s.get("todofuken_j_name") or "",
+        "city": s.get("shi_gun_shima_mei") or "",
+        "address": f'{s.get("todofuken_j_name") or ""}{s.get("shi_gun_shima_mei") or ""}{s.get("other_address") or ""}',
+        "tel": s.get("telephone") or "",
+        "hours": s.get("EIGYO_MIDASHI_1_EX") or "",
+        "url": s.get("url") or f"{BASE}/shop/detail/{code}/",
+        "reservable": s.get("reservation_flag") == 1,
+        "notice": s.get("eigyo_jikan_henko_auto") or "",
+        "lat": s.get("lat"),
+        "lon": s.get("lon"),
+    }
+
+
+def _shops(data):
+    return [x for x in (_shop(s) for s in data.get("shop_data") or []) if x]
+
+
 def fetch_shops(lat, lon):
-    path = f"/shop/api_json.php?lon={lon}&lat={lat}"
-    data = post_json(path, f"{BASE}/shop/areasearchMap.html?lon={lon}&lat={lat}")
-    shops = []
-    for s in data.get("shop_data") or []:
-        code = s.get("shop_w_code") or (s.get("url") or "").rstrip("/").split("/")[-1]
-        if not code:
-            continue
-        shops.append({
-            "code": code,
-            "name": s.get("shop_name", code),
-            "address": f'{s.get("todofuken_j_name") or ""}{s.get("shi_gun_shima_mei") or ""}{s.get("other_address") or ""}',
-            "tel": s.get("telephone") or "",
-            "hours": s.get("EIGYO_MIDASHI_1_EX") or "",
-            "url": s.get("url") or f"{BASE}/shop/detail/{code}/",
-            "reservable": s.get("reservation_flag") == 1,
-            "notice": s.get("eigyo_jikan_henko_auto") or "",
-            "lat": s.get("lat"),
-            "lon": s.get("lon"),
-        })
-    return shops
+    """指定地点から近い順に最大10店舗"""
+    data = post_json(f"/shop/api_json.php?lon={lon}&lat={lat}",
+                     f"{BASE}/shop/areasearchMap.html?lon={lon}&lat={lat}")
+    return _shops(data)
+
+
+def fetch_pref_shops(pref):
+    """都道府県内の全店舗"""
+    if pref not in PREFS:
+        raise FetchError(f"都道府県名が不正です: {pref}")
+    data = post_json(f"/shop/api_json.php?pref={urllib.parse.quote(pref)}", f"{BASE}/shop/")
+    return _shops(data)
 
 
 def _fetch_days(shop_code, work_cd, referer):
@@ -97,9 +130,12 @@ def _fetch_days(shop_code, work_cd, referer):
 
 
 def fetch_days(shop_code, purpose=DEFAULT_PURPOSE):
-    """指定した来店目的の2週間分の生データ。取得できなければ None。"""
+    """指定した来店目的の2週間分の生データ。受け付けていなければ None。
+    ワイモバイルショップ（店舗コードが W で始まる）とソフトバンクショップでコードが違う。"""
+    _, sb, ym = PURPOSES[norm_purpose(purpose)]
+    order = [ym, sb] if shop_code.upper().startswith("W") else [sb, ym]
     referer = f"{BASE}/shop/detail/{shop_code}/"
-    for cd in [purpose] + FALLBACK_CODES:
+    for cd in order:
         days = _fetch_days(shop_code, cd, referer)
         if days is not None:
             return days
@@ -137,7 +173,7 @@ def group_starts(starts):
 
 
 def shop_calendar(shop_code, purpose=DEFAULT_PURPOSE, t_from=None, t_to=None, dates=None):
-    """[{date, label, status, starts:["HHMM",...], times:["14:00〜18:45",...]}]。取得できなければ None"""
+    """[{date, label, status, starts:["HHMM",...], times:["14:00〜18:45",...]}]。受け付けていなければ None"""
     days = fetch_days(shop_code, purpose)
     if days is None:
         return None

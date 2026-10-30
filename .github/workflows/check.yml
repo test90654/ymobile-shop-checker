@@ -12,6 +12,10 @@ on:
         type: choice
         options: [normal, test, diagnose]
         default: normal
+      prefecture:
+        description: "都道府県（空なら config.json の設定）例: 埼玉県"
+        type: string
+        default: ""
 
 permissions:
   contents: write             # state.json をコミットするため
@@ -23,7 +27,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 14
     steps:
       - uses: actions/checkout@v5
 
@@ -34,6 +38,7 @@ jobs:
       - name: Check availability & notify
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          PREFECTURE_OVERRIDE: ${{ inputs.prefecture }}
         run: |
           case "${{ inputs.mode }}" in
             test)     python notify.py --test ;;
@@ -42,7 +47,7 @@ jobs:
           esac
 
       - name: Save state
-        if: inputs.mode != 'diagnose'
+        if: inputs.mode != 'diagnose' && inputs.prefecture == ''
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
