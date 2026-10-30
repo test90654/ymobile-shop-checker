@@ -1,0 +1,72 @@
+name: Prefecture snapshot
+
+# 県内全店舗の空き状況をまとめて取得し、data ブランチに JSON で保存する。
+# スマホ画面（Render）の「最新にする」ボタンからも起動される。
+on:
+  schedule:
+    # 8:00〜20:59 JST に30分ごと：config.json の snapshot_prefs × snapshot_purposes
+    - cron: "12,42 23 * * *"
+    - cron: "12,42 0-11 * * *"
+  workflow_dispatch:
+    inputs:
+      pref:
+        description: "都道府県（空なら config.json の snapshot_prefs）"
+        type: string
+        default: ""
+      purpose:
+        description: "来店目的（mnp_out など。空なら config.json の snapshot_purposes）"
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: snapshot-${{ inputs.pref }}-${{ inputs.purpose }}
+  cancel-in-progress: true
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Fetch availability
+        env:
+          IN_PREF: ${{ inputs.pref }}
+          IN_PURPOSE: ${{ inputs.purpose }}
+        run: |
+          python - <<'PY'
+          import json, os, subprocess
+          cfg = json.load(open("config.json", encoding="utf-8"))
+          prefs = [os.environ["IN_PREF"]] if os.environ.get("IN_PREF") else cfg.get("snapshot_prefs") or []
+          purposes = [os.environ["IN_PURPOSE"]] if os.environ.get("IN_PURPOSE") else cfg.get("snapshot_purposes") or ["mnp_out"]
+          for p in prefs:
+              for u in purposes:
+                  subprocess.run(["python", "snapshot.py", "--pref", p, "--purpose", u, "--out", "out"], check=False)
+          PY
+          ls -la out || true
+
+      - name: Save to data branch
+        run: |
+          [ -d out ] && [ -n "$(ls out)" ] || { echo "nothing to save"; exit 0; }
+          git config --global user.name  "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for i in 1 2 3 4 5; do
+            rm -rf d && mkdir d && cd d
+            git init -q -b data
+            git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}"
+            if git fetch -q --depth 1 origin data 2>/dev/null; then git checkout -q -B data FETCH_HEAD; fi
+            mkdir -p data && cp ../out/*.json data/
+            git add data
+            git diff --cached --quiet && { echo "no change"; exit 0; }
+            git commit -q -m "snapshot $(TZ=Asia/Tokyo date '+%F %R')"
+            git push -q origin data && exit 0
+            cd .. && sleep $((i * 3))
+          done
+          exit 1
