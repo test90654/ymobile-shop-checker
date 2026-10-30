@@ -7,9 +7,16 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn app:app --workers 1 --threads 4 --timeout 120 --bind 0.0.0.0:$PORT
     healthCheckPath: /healthz
+    envVars:
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: GITHUB_REPO
+        value: test90654/ymobile-shop-checker
     autoDeploy: true
     buildFilter:
       ignoredPaths:
         - state.json
         - README.md
         - .github/**
+        - snapshot.py
+        - notify.py

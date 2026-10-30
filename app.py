@@ -1,37 +1,38 @@
 # -*- coding: utf-8 -*-
 """スマホ用の空き状況ビューア（Render で動かす Web アプリ）
 
-都道府県を選ぶと県内の全店舗の空きをまとめて調べ、空きのある店舗だけを早い順に表示する。
+Render のサーバーからはワイモバイルのサイトに直接アクセスできない（403）ため、
+空き状況の取得は GitHub Actions（snapshot.yml）が行い、結果を data ブランチに保存する。
+この画面はその結果を表示し、「最新にする」で GitHub Actions に取得を依頼する。
+
+環境変数
+  GITHUB_TOKEN  : このリポジトリの Actions(書き込み) と Contents(読み取り) 権限を持つトークン
+  GITHUB_REPO   : 既定 test90654/ymobile-shop-checker
 """
 
+import gzip
 import json
-import math
+import os
 import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, Response, jsonify, render_template_string, request
 
 import ymobile as ym
 
 app = Flask(__name__)
 ROOT = Path(__file__).parent
-CACHE_SEC = 120
-_cache, _lock = {}, threading.Lock()
+REPO = os.environ.get("GITHUB_REPO", "test90654/ymobile-shop-checker")
+TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
+SNAP_CACHE_SEC = 20
+REFRESH_COOLDOWN_SEC = 120
 
-
-def cached(key, fn):
-    with _lock:
-        hit = _cache.get(key)
-        if hit and time.time() - hit[0] < CACHE_SEC:
-            return hit[1]
-    val = fn()
-    with _lock:
-        _cache[key] = (time.time(), val)
-        if len(_cache) > 2000:  # 古いものを掃除
-            for k in sorted(_cache, key=lambda k: _cache[k][0])[:500]:
-                _cache.pop(k, None)
-    return val
+_lock = threading.Lock()
+_snap_cache = {}     # name -> (time, bytes or None)
+_last_refresh = {}   # name -> time
 
 
 def config():
@@ -41,67 +42,98 @@ def config():
         return {}
 
 
-def dist_km(lat1, lon1, lat2, lon2):
+def snapshot_name(pref, purpose):
+    return f"{ym.PREFS.index(pref) + 1:02d}_{purpose}.json"
+
+
+def gh(method, path, body=None, raw=False):
+    headers = {"Accept": "application/vnd.github.raw" if raw else "application/vnd.github+json",
+               "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "ymobile-shop-checker"}
+    if TOKEN:
+        headers["Authorization"] = f"Bearer {TOKEN}"
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(f"https://api.github.com{path}", data=data, method=method, headers=headers)
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return r.status, r.read()
+
+
+def load_snapshot(name):
+    """data ブランチの JSON（bytes）。なければ None"""
+    with _lock:
+        hit = _snap_cache.get(name)
+        if hit and time.time() - hit[0] < SNAP_CACHE_SEC:
+            return hit[1]
     try:
-        lat1, lon1, lat2, lon2 = map(float, (lat1, lon1, lat2, lon2))
-    except (TypeError, ValueError):
-        return None
-    p = math.pi / 180
-    a = (math.sin((lat2 - lat1) * p / 2) ** 2
-         + math.cos(lat1 * p) * math.cos(lat2 * p) * math.sin((lon2 - lon1) * p / 2) ** 2)
-    return 12742 * math.asin(math.sqrt(a))
+        _, body = gh("GET", f"/repos/{REPO}/contents/data/{name}?ref=data", raw=True)
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            raise
+        body = None
+    with _lock:
+        _snap_cache[name] = (time.time(), body)
+    return body
+
+
+def args():
+    pref = request.values.get("pref", "")
+    purpose = request.values.get("purpose", ym.DEFAULT_PURPOSE)
+    if pref not in ym.PREFS:
+        return None, None, (jsonify(error="都道府県名が不正です"), 400)
+    if purpose not in ym.PURPOSES:
+        return None, None, (jsonify(error="来店目的が不正です"), 400)
+    return pref, purpose, None
 
 
 @app.get("/")
 def index():
     cfg = config()
-    pref = cfg.get("prefecture") if cfg.get("prefecture") in ym.PREFS else "埼玉県"
+    prefs = cfg.get("snapshot_prefs") or []
+    pref = cfg.get("prefecture") or (prefs[0] if prefs else "埼玉県")
+    pref = pref if pref in ym.PREFS else "埼玉県"
     return render_template_string(
-        PAGE, lat=cfg.get("lat", 36.2494035), lon=cfg.get("lon", 139.1804534),
-        purposes={k: v[0] for k, v in ym.PURPOSES.items()},
-        purpose=ym.norm_purpose(cfg.get("purpose")), prefs=ym.PREFS, pref=pref)
+        PAGE, purposes={k: v[0] for k, v in ym.PURPOSES.items()},
+        purpose=ym.norm_purpose(cfg.get("purpose")), prefs=ym.PREFS, pref=pref,
+        can_refresh=bool(TOKEN))
 
 
-@app.get("/api/shops")
-def api_shops():
-    pref = request.args.get("pref")
-    lat = request.args.get("lat", type=float)
-    lon = request.args.get("lon", type=float)
+@app.get("/api/snapshot")
+def api_snapshot():
+    pref, purpose, err = args()
+    if err:
+        return err
     try:
-        if pref:
-            if pref not in ym.PREFS:
-                return jsonify(error="都道府県名が不正です"), 400
-            shops = cached(f"pref:{pref}", lambda: ym.fetch_pref_shops(pref))
-        elif lat is not None and lon is not None:
-            shops = cached(f"near:{lat:.4f},{lon:.4f}", lambda: ym.fetch_shops(lat, lon))
-        else:
-            return jsonify(error="pref か lat/lon が必要です"), 400
-    except ym.FetchError as e:
-        return jsonify(error=f"店舗一覧を取得できませんでした（{e}）"), 502
-    out = []
-    for s in shops:
-        s = dict(s)
-        if lat is not None and lon is not None:
-            d = dist_km(lat, lon, s.get("lat"), s.get("lon"))
-            s["km"] = round(d, 1) if d is not None else None
-        out.append(s)
-    return jsonify(shops=out)
+        body = load_snapshot(snapshot_name(pref, purpose))
+    except Exception as e:  # noqa: BLE001
+        return jsonify(error=f"GitHub から結果を読めませんでした（{e}）"), 502
+    if body is None:
+        return jsonify(missing=True)
+    if "gzip" in request.headers.get("Accept-Encoding", ""):
+        return Response(gzip.compress(body, 6), mimetype="application/json",
+                        headers={"Content-Encoding": "gzip", "Cache-Control": "no-store"})
+    return Response(body, mimetype="application/json", headers={"Cache-Control": "no-store"})
 
 
-@app.get("/api/shop/<code>")
-def api_shop(code):
-    if not code.isalnum() or len(code) > 12:
-        return jsonify(error="店舗コードが不正です"), 400
-    purpose = request.args.get("purpose", ym.DEFAULT_PURPOSE)
-    if purpose not in ym.PURPOSES:
-        return jsonify(error="来店目的が不正です"), 400
+@app.post("/api/refresh")
+def api_refresh():
+    pref, purpose, err = args()
+    if err:
+        return err
+    if not TOKEN:
+        return jsonify(error="Render に GITHUB_TOKEN が設定されていないため、最新取得を依頼できません"), 503
+    name = snapshot_name(pref, purpose)
+    with _lock:
+        last = _last_refresh.get(name, 0)
+        if time.time() - last < REFRESH_COOLDOWN_SEC:
+            return jsonify(ok=True, already=True)
+        _last_refresh[name] = time.time()
     try:
-        cal = cached(f"cal:{code}:{purpose}", lambda: ym.shop_calendar(code, purpose))
-    except ym.FetchError as e:
-        return jsonify(error=f"取得できませんでした（{e}）"), 502
-    if cal is None:
-        return jsonify(days=None)  # この目的は受け付けていない店舗
-    return jsonify(days=cal)
+        gh("POST", f"/repos/{REPO}/actions/workflows/snapshot.yml/dispatches",
+           {"ref": "main", "inputs": {"pref": pref, "purpose": purpose}})
+    except urllib.error.HTTPError as e:
+        with _lock:
+            _last_refresh.pop(name, None)
+        return jsonify(error=f"GitHub への依頼に失敗しました（HTTP {e.code}）"), 502
+    return jsonify(ok=True)
 
 
 @app.get("/healthz")
@@ -120,48 +152,47 @@ PAGE = r"""<!doctype html>
 :root{
   --bg:#f4f5f7; --card:#fff; --ink:#15181d; --sub:#5d6470; --line:#e3e6ea;
   --accent:#0b1f3a; --on-accent:#fff; --ok:#0a7d4f; --okbg:#e3f5ec; --off:#9aa1ab; --offbg:#eef0f2;
-  --sat:#3b5bdb; --sun:#c92a2a; --bar:#0a7d4f;
+  --sat:#3b5bdb; --sun:#c92a2a; --warn:#b26b00;
 }
 @media (prefers-color-scheme: dark){:root{
   --bg:#0f1114; --card:#1a1d22; --ink:#eef0f3; --sub:#9aa2ad; --line:#2a2e35;
   --accent:#8fb4ff; --on-accent:#0f1114; --ok:#5fd6a0; --okbg:#15322a; --off:#6b727c; --offbg:#22262c;
-  --sat:#9db1ff; --sun:#ff8787; --bar:#5fd6a0;
+  --sat:#9db1ff; --sun:#ff8787; --warn:#f0b74f;
 }}
 *{box-sizing:border-box}
 [hidden]{display:none!important}
 body{margin:0;background:var(--bg);color:var(--ink);
   font:15px/1.5 -apple-system,BlinkMacSystemFont,"Hiragino Sans","Noto Sans JP",sans-serif;
   padding-bottom:env(safe-area-inset-bottom)}
-header{background:var(--accent);color:var(--on-accent);padding:14px 16px 14px}
-h1{margin:0 0 10px;font-size:18px}
-.seg{display:flex;background:rgba(255,255,255,.14);border-radius:10px;padding:3px;margin-bottom:10px}
-@media (prefers-color-scheme: dark){.seg{background:rgba(0,0,0,.14)}}
-.seg button{flex:1;font:inherit;font-size:14px;border:0;border-radius:8px;padding:7px;background:none;color:inherit;cursor:pointer}
-.seg button.on{background:var(--card);color:var(--ink);font-weight:600}
+header{background:var(--accent);color:var(--on-accent);padding:14px 16px}
+h1{margin:0 0 4px;font-size:18px}
 select,input{display:block;width:100%;font:inherit;font-size:16px;color:var(--ink);background:var(--card);
   border:1px solid var(--line);border-radius:10px;padding:10px 12px}
 label{display:block;font-size:12px;opacity:.85;margin:8px 0 4px}
 .row2{display:flex;gap:8px}.row2>*{flex:1;min-width:0}
-.go{display:block;width:100%;margin-top:12px;font:inherit;font-weight:700;border:0;border-radius:10px;padding:11px;
-  background:var(--card);color:var(--ink);cursor:pointer}
-main{padding:12px 16px 40px;max-width:640px;margin:0 auto}
-.prog{position:sticky;top:0;z-index:4;background:var(--bg);padding:8px 0 8px}
-.ptext{font-size:13px;color:var(--sub)}
-.pbar{height:4px;background:var(--offbg);border-radius:4px;overflow:hidden;margin-top:6px}
-.pbar i{display:block;height:100%;width:0;background:var(--bar);transition:width .2s}
-.dates{display:flex;gap:6px;overflow-x:auto;padding:8px 0 4px;margin:0 -16px;padding-left:16px;padding-right:16px;scrollbar-width:none}
+main{padding:10px 16px 40px;max-width:640px;margin:0 auto}
+.stat{position:sticky;top:0;z-index:4;background:var(--bg);padding:8px 0 4px}
+.line{display:flex;align-items:center;gap:8px}
+.stext{flex:1;font-size:13px;color:var(--sub)}
+.stext b{color:var(--ink)}
+.stext.old b{color:var(--warn)}
+.btn{font:inherit;font-size:13px;font-weight:600;border:1px solid var(--line);background:var(--card);color:var(--ink);
+  border-radius:9px;padding:6px 10px;cursor:pointer;white-space:nowrap}
+.btn:disabled{opacity:.55}
+.dates{display:flex;gap:6px;overflow-x:auto;padding:8px 16px 4px;margin:0 -16px;scrollbar-width:none}
 .dates::-webkit-scrollbar{display:none}
 .dchip{flex:0 0 auto;font:inherit;font-size:13px;border:1px solid var(--line);background:var(--card);color:var(--ink);
   border-radius:20px;padding:5px 11px;cursor:pointer;white-space:nowrap}
 .dchip.on{background:var(--ink);color:var(--bg);border-color:var(--ink)}
 .dchip .n{font-size:11px;opacity:.7;margin-left:3px}
 .dchip.zero{color:var(--off)}
-.opts{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--sub);margin:6px 0 10px}
+.opts{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:13px;color:var(--sub);margin:4px 0 10px}
+.opts label{display:flex;gap:5px;align-items:center;margin:0;font-size:13px;opacity:1}
 .opts input{width:auto;display:inline}
 .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:13px 14px;margin-bottom:10px}
 .card h2{font-size:15.5px;margin:0}
 .meta{font-size:12.5px;color:var(--sub)}
-.notice{font-size:12px;color:#b26b00;margin-top:2px}
+.notice{font-size:12px;color:var(--warn);margin-top:2px}
 .days{margin-top:8px}
 .d{display:flex;gap:10px;align-items:flex-start;padding:6px 0;border-top:1px solid var(--line)}
 .dl{flex:0 0 66px;font-weight:600;font-size:14px;padding-top:2px;font-variant-numeric:tabular-nums}
@@ -180,165 +211,163 @@ main{padding:12px 16px 40px;max-width:640px;margin:0 auto}
 <body>
 <header>
   <h1>ワイモバイル 来店予約の空き</h1>
-  <div class="seg" id="mode">
-    <button data-m="pref">都道府県でまとめて</button>
-    <button data-m="near">現在地の近く</button>
-  </div>
-  <div id="prefBox" class="row2">
+  <div class="row2">
     <div><label for="pref">都道府県</label>
       <select id="pref">{% for p in prefs %}<option{% if p == pref %} selected{% endif %}>{{ p }}</option>{% endfor %}</select></div>
-    <div><label for="city">市区町村で絞る（任意）</label>
-      <input id="city" placeholder="例: 本庄 / さいたま" autocomplete="off"></div>
+    <div><label for="city">市区町村・店名で絞る</label>
+      <input id="city" placeholder="例: 本庄 / 春日部" autocomplete="off"></div>
   </div>
   <label for="purpose">来店目的</label>
   <select id="purpose">{% for k, v in purposes.items() %}<option value="{{ k }}"{% if k == purpose %} selected{% endif %}>{{ v }}</option>{% endfor %}</select>
-  <button class="go" id="go">この条件で探す</button>
 </header>
 <main>
-  <div class="prog" id="prog" hidden>
-    <div class="ptext" id="ptext"></div>
-    <div class="pbar"><i id="pbar"></i></div>
+  <div class="stat">
+    <div class="line"><div class="stext" id="stext">読み込み中…</div>
+      <button class="btn" id="refresh"{% if not can_refresh %} hidden{% endif %}>↻ 最新にする</button></div>
     <div class="dates" id="dates"></div>
   </div>
-  <div class="opts" id="opts" hidden><label style="margin:0;opacity:1;display:flex;gap:6px;align-items:center">
-    <input type="checkbox" id="showAll"> 空きのない店舗も表示</label></div>
-  <div id="list"><div class="empty">条件を選んで「この条件で探す」を押してください</div></div>
+  <div class="opts">
+    <label><input type="checkbox" id="near"> 現在地から近い順</label>
+    <label><input type="checkbox" id="showAll"> 空きのない店舗も表示</label>
+  </div>
+  <div id="list"></div>
 </main>
 <script>
-const HOME = {lat: {{ lat }}, lon: {{ lon }}};
-const PARALLEL = 3;
+const CAN_REFRESH = {{ 'true' if can_refresh else 'false' }};
+const WEEK = "日月火水木金土";
 const $ = s => document.querySelector(s);
 const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
 const store = { get(k){ try{ return localStorage.getItem(k); }catch(e){ return null; } }, set(k,v){ try{ localStorage.setItem(k,v); }catch(e){} } };
 
-let mode = store.get("mode") || "pref";
-let run = 0;            // 条件を変えたら古い検索結果を捨てるための番号
-let results = [];       // [{shop, days, err}]
-let dateSel = "all";
+let snap = null, dateSel = "all", here = null, polling = 0;
 
-for (const id of ["pref","purpose","city"]) { const v = store.get(id); if (v != null && v !== "") { const e = $("#"+id); if (e.tagName !== "SELECT" || [...e.options].some(o=>o.value===v)) e.value = v; } }
-function setMode(m){ mode = m; store.set("mode", m);
-  document.querySelectorAll("#mode button").forEach(b => b.classList.toggle("on", b.dataset.m === m));
-  $("#prefBox").style.display = m === "pref" ? "" : "none"; }
-document.querySelectorAll("#mode button").forEach(b => b.onclick = () => setMode(b.dataset.m));
-setMode(mode);
+for (const id of ["pref","purpose","city"]) { const v = store.get(id); if (v) { const e = $("#"+id); if (e.tagName !== "SELECT" || [...e.options].some(o=>o.value===v)) e.value = v; } }
+$("#near").checked = store.get("near") === "1";
 
-async function getJSON(url){
-  const r = await fetch(url); const j = await r.json().catch(()=>({error:"応答を読めませんでした（サーバー起動中かもしれません）"}));
+function q(){ return `pref=${encodeURIComponent($("#pref").value)}&purpose=${encodeURIComponent($("#purpose").value)}`; }
+async function getJSON(url, opt){
+  const r = await fetch(url, opt); const j = await r.json().catch(()=>({error:"応答を読めませんでした（サーバー起動中かもしれません。少し待って再読み込みしてください）"}));
   if (!r.ok) throw new Error(j.error || r.status); return j;
 }
-function position(){
-  return new Promise((ok, ng) => {
-    if (!navigator.geolocation) return ng(new Error("位置情報が使えません"));
-    navigator.geolocation.getCurrentPosition(p => ok({lat:p.coords.latitude, lon:p.coords.longitude}),
-      () => ng(new Error("現在地を取得できませんでした")), {timeout: 10000});
-  });
+
+function label(ymd){ const d = new Date(+ymd.slice(0,4), +ymd.slice(4,6)-1, +ymd.slice(6,8)); return `${d.getMonth()+1}/${d.getDate()}(${WEEK[d.getDay()]})`; }
+const hm = t => t.slice(0,2) + ":" + t.slice(2);
+const mins = t => +t.slice(0,2)*60 + +t.slice(2);
+function group(starts){
+  const out = []; let run = [];
+  for (const t of starts) { if (run.length && mins(t) - mins(run[run.length-1]) !== 15) { out.push(run); run = []; } run.push(t); }
+  if (run.length) out.push(run);
+  return out.map(r => r.length === 1 ? hm(r[0]) : `${hm(r[0])}〜${hm(r[r.length-1])}`);
+}
+function ago(iso){
+  const m = Math.round((Date.now() - new Date(iso).getTime()) / 60000);
+  return m < 1 ? "たった今" : m < 60 ? `${m}分前` : `${Math.floor(m/60)}時間${m%60}分前`;
+}
+function km(s){
+  if (!here || s.lat == null) return null;
+  const p = Math.PI/180, a = Math.sin((s.lat-here.lat)*p/2)**2 + Math.cos(here.lat*p)*Math.cos(s.lat*p)*Math.sin((s.lon-here.lon)*p/2)**2;
+  return 12742 * Math.asin(Math.sqrt(a));
 }
 
-$("#go").onclick = search;
-$("#showAll").onchange = render;
-
-async function search(){
-  const my = ++run;
+async function load(){
   ["pref","purpose","city"].forEach(id => store.set(id, $("#"+id).value));
-  results = []; dateSel = "all";
-  $("#list").innerHTML = ""; $("#prog").hidden = false; $("#opts").hidden = true; $("#dates").innerHTML = "";
-  setProg("店舗一覧を取得しています…（初回はサーバー起動に30秒ほどかかります）", 0);
-  let shops;
+  const my = ++polling;
+  snap = null; dateSel = "all"; render();
+  $("#stext").textContent = "読み込み中…（初回はサーバー起動に30秒ほどかかります）";
   try {
-    if (mode === "pref") {
-      shops = (await getJSON(`/api/shops?pref=${encodeURIComponent($("#pref").value)}`)).shops;
-    } else {
-      setProg("現在地を取得しています…", 0);
-      let pos; try { pos = await position(); } catch(e) { pos = HOME; }
-      shops = (await getJSON(`/api/shops?lat=${pos.lat}&lon=${pos.lon}`)).shops;
+    const j = await getJSON(`/api/snapshot?${q()}`);
+    if (my !== polling) return;
+    if (j.missing) {
+      $("#stext").textContent = "この県・目的のデータはまだありません。";
+      if (CAN_REFRESH) refresh(true);
+      return;
     }
-  } catch(e) { if (my === run) setProg("⚠ " + e.message, 0); return; }
-  if (my !== run) return;
-  const city = $("#city").value.trim();
-  shops = shops.filter(s => s.reservable && (mode !== "pref" || !city || (s.city + s.name).includes(city)));
-  if (!shops.length) { setProg("条件に合う店舗がありません", 1); return; }
-
-  const purpose = $("#purpose").value;
-  let done = 0, i = 0;
-  const worker = async () => {
-    while (i < shops.length && my === run) {
-      const s = shops[i++];
-      let days = null, err = null;
-      try { days = (await getJSON(`/api/shop/${encodeURIComponent(s.code)}?purpose=${purpose}`)).days; }
-      catch(e) { err = e.message; }
-      if (my !== run) return;
-      results.push({shop: s, days, err, order: shops.indexOf(s)});
-      done++;
-      setProg(progText(done, shops.length), done / shops.length);
-      render();
-    }
-  };
-  await Promise.all(Array.from({length: PARALLEL}, worker));
-  if (my === run) { setProg(progText(done, shops.length, true), 1); render(); }
+    snap = j; render();
+    if (CAN_REFRESH && (Date.now() - new Date(j.updated_at).getTime()) > 20*60000) refresh(true);
+  } catch(e) { if (my === polling) $("#stext").textContent = "⚠ " + e.message; }
 }
 
-function openCount(){ return results.filter(r => firstSlot(r) !== null).length; }
-function progText(done, total, fin){
-  const n = openCount();
-  return fin ? `${total}店舗を確認しました。空きがあるのは ${n}店舗`
-             : `${done} / ${total} 店舗を確認中… 空きあり ${n}店舗`;
+async function refresh(auto){
+  const btn = $("#refresh"); btn.disabled = true;
+  const my = ++polling;
+  const before = snap ? snap.updated_at : null;
+  const base = snap ? statusText() + " ／ " : "";
+  try { await getJSON(`/api/refresh?${q()}`, {method: "POST"}); }
+  catch(e) { btn.disabled = false; $("#stext").textContent = base + "⚠ " + e.message; return; }
+  const t0 = Date.now();
+  while (my === polling && Date.now() - t0 < 6*60000) {
+    const sec = Math.round((Date.now() - t0) / 1000);
+    $("#stext").textContent = base + `GitHubで最新の空きを取得中…（${sec}秒、1〜2分かかります）`;
+    await new Promise(r => setTimeout(r, 5000));
+    if (my !== polling) return;
+    if ((Date.now() - t0) / 1000 < 30) continue;
+    try {
+      const j = await getJSON(`/api/snapshot?${q()}`);
+      if (!j.missing && j.updated_at !== before) { snap = j; btn.disabled = false; render(); return; }
+    } catch(e) {}
+  }
+  if (my === polling) { btn.disabled = false; $("#stext").textContent = base + "取得に時間がかかっています。少ししてから再読み込みしてください"; }
 }
-function setProg(t, ratio){ $("#ptext").textContent = t; $("#pbar").style.width = Math.round(ratio*100) + "%"; }
 
-function daysOf(r){ return (r.days || []).filter(d => dateSel === "all" || d.date === dateSel); }
-function firstSlot(r){
-  for (const d of daysOf(r)) if (d.starts.length) return d.date + d.starts[0];
-  return null;
+function shopsFiltered(){
+  const kw = $("#city").value.trim();
+  return snap.shops.filter(s => !kw || (s.city + s.name).includes(kw));
+}
+function startsOf(s){ return (s.days || []).filter(d => dateSel === "all" || d.date === dateSel); }
+function firstSlot(s){ for (const d of startsOf(s)) if (d.starts.length) return d.date + d.starts[0]; return null; }
+function statusText(){
+  const shops = shopsFiltered(), open = shops.filter(s => firstSlot(s) !== null).length;
+  return `<b>${ago(snap.updated_at)}</b>の情報・${shops.length}店中 空きあり ${open}店`;
 }
 
-function renderDates(){
-  const box = $("#dates"); const all = new Map();
-  results.forEach(r => (r.days || []).forEach(d => {
-    if (!all.has(d.date)) all.set(d.date, {label: d.label, n: 0});
-    if (d.starts.length) all.get(d.date).n++;
+function render(){
+  const list = $("#list"), box = $("#dates");
+  list.innerHTML = ""; box.innerHTML = "";
+  if (!snap) return;
+  const st = $("#stext"); st.innerHTML = statusText();
+  st.classList.toggle("old", Date.now() - new Date(snap.updated_at).getTime() > 30*60000);
+
+  const shops = shopsFiltered();
+  const all = new Map();
+  shops.forEach(s => (s.days || []).forEach(d => {
+    if (!all.has(d.date)) all.set(d.date, 0);
+    if (d.starts.length) all.set(d.date, all.get(d.date) + 1);
   }));
-  const keys = [...all.keys()].sort();
-  box.innerHTML = "";
-  const mk = (key, text, n) => {
+  const chip = (key, text, n) => {
     const b = el("button", "dchip" + (dateSel === key ? " on" : "") + (n === 0 ? " zero" : ""), text);
     if (n != null) b.append(el("span","n", n + "店"));
     b.onclick = () => { dateSel = key; render(); };
     box.append(b);
   };
-  mk("all", "すべての日", null);
-  keys.forEach(k => mk(k, all.get(k).label, all.get(k).n));
-}
+  chip("all", "すべての日", null);
+  [...all.keys()].sort().forEach(k => chip(k, label(k), all.get(k)));
 
-function render(){
-  renderDates();
-  $("#opts").hidden = results.length === 0;
-  const showAll = $("#showAll").checked;
-  const list = $("#list"); list.innerHTML = "";
-  const rows = results
-    .map(r => ({r, key: firstSlot(r)}))
+  const showAll = $("#showAll").checked, near = $("#near").checked && here;
+  const rows = shops.map((s, i) => ({s, i, key: firstSlot(s), km: km(s)}))
     .filter(x => showAll || x.key !== null)
-    .sort((a, b) => (a.key === null) - (b.key === null) || (a.key || "").localeCompare(b.key || "") || a.r.order - b.r.order);
-  if (!rows.length) { list.append(el("div","empty", results.length ? "今のところ空きのある店舗はありません" : "")); return; }
-  rows.forEach(({r}) => list.append(card(r)));
+    .sort((a, b) => near ? (a.km ?? 1e9) - (b.km ?? 1e9)
+      : (a.key === null) - (b.key === null) || (a.key || "").localeCompare(b.key || "") || a.i - b.i);
+  if (!rows.length) { list.append(el("div","empty","条件に合う空きのある店舗はありません")); return; }
+  rows.slice(0, 150).forEach(x => list.append(card(x.s, x.km)));
 }
 
-function card(r){
-  const s = r.shop, c = el("div","card");
+function card(s, dist){
+  const c = el("div","card");
   c.append(el("h2", null, s.name));
-  c.append(el("div","meta", [s.km != null ? s.km + "km" : "", s.city, s.hours].filter(Boolean).join("・")));
-  if (s.notice) c.append(el("div","notice","臨時情報：" + s.notice));
+  c.append(el("div","meta", [dist != null ? dist.toFixed(1) + "km" : "", s.city, s.hours].filter(Boolean).join("・")));
+  if (s.notice) c.append(el("div","notice","臨時情報：" + s.notice.replace(/\s*<[^>]*>\s*/g, " / ")));
   const box = el("div","days");
-  if (r.err) box.append(el("div","err", r.err));
-  else if (r.days === null) box.append(el("div","none", "この来店目的はWeb予約を受け付けていません"));
+  if (s.err) box.append(el("div","err", "取得エラー：" + s.err));
+  else if (s.days === null) box.append(el("div","none", "この来店目的はWeb予約を受け付けていません"));
   else {
-    const ds = daysOf(r).filter(d => d.starts.length || $("#showAll").checked);
+    const showAll = $("#showAll").checked;
+    const ds = startsOf(s).filter(d => d.starts.length || showAll);
     if (!ds.length) box.append(el("div","none", "Webの空きなし（電話で確認）"));
     ds.forEach(d => {
-      const row = el("div","d");
-      row.append(el("div", "dl" + (/土/.test(d.label) ? " sat" : /日\)/.test(d.label) ? " sun" : ""), d.label));
+      const row = el("div","d"), lab = label(d.date);
+      row.append(el("div", "dl" + (lab.includes("土") ? " sat" : lab.includes("(日)") ? " sun" : ""), lab));
       const ts = el("div","ts");
-      if (d.times.length) d.times.forEach(t => ts.append(el("span","chip", t)));
+      if (d.starts.length) group(d.starts).forEach(t => ts.append(el("span","chip", t)));
       else ts.append(el("span","none", d.status === "holiday" ? "定休日" : "空きなし"));
       row.append(ts); box.append(row);
     });
@@ -350,6 +379,22 @@ function card(r){
   a.append(a1, a2); c.append(a);
   return c;
 }
+
+$("#pref").onchange = load;
+$("#purpose").onchange = load;
+$("#city").oninput = () => { store.set("city", $("#city").value); render(); };
+$("#showAll").onchange = render;
+$("#refresh").onclick = () => refresh(false);
+$("#near").onchange = () => {
+  store.set("near", $("#near").checked ? "1" : "0");
+  if ($("#near").checked && !here && navigator.geolocation) {
+    navigator.geolocation.getCurrentPosition(p => { here = {lat:p.coords.latitude, lon:p.coords.longitude}; render(); },
+      () => { $("#near").checked = false; alert("現在地を取得できませんでした"); }, {timeout: 10000});
+  } else render();
+};
+if ($("#near").checked) $("#near").onchange();
+setInterval(() => { if (snap && !$("#refresh").disabled) $("#stext").innerHTML = statusText(); }, 30000);
+load();
 </script>
 </body>
 </html>

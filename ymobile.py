@@ -80,6 +80,12 @@ def post_json(path, referer):
         raise FetchError(f"JSONではない応答（ブロックされた可能性）: {body[:120]!r}") from e
 
 
+def _plain(html):
+    """店舗の臨時情報に混ざる <br /> などのタグを取り除く"""
+    import re
+    return re.sub(r"\s*/\s*$", "", re.sub(r"\s*<[^>]*>\s*", " / ", html or "")).strip(" /")
+
+
 def _shop(s):
     code = s.get("shop_w_code") or (s.get("url") or "").rstrip("/").split("/")[-1]
     if not code:
@@ -94,7 +100,7 @@ def _shop(s):
         "hours": s.get("EIGYO_MIDASHI_1_EX") or "",
         "url": s.get("url") or f"{BASE}/shop/detail/{code}/",
         "reservable": s.get("reservation_flag") == 1,
-        "notice": s.get("eigyo_jikan_henko_auto") or "",
+        "notice": _plain(s.get("eigyo_jikan_henko_auto")),
         "lat": s.get("lat"),
         "lon": s.get("lon"),
     }
