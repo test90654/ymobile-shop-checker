@@ -1,6 +1,6 @@
-# ワイモバイル店舗 来店予約 空き状況チェッカー
+# ワイモバイル／ドコモショップ 来店予約 空き状況チェッカー
 
-- **スマホ画面（Render）**: 都道府県（または現在地の近く）の全店舗をまとめて調べ、予約できる開始時刻を空きのある店だけ早い順に表示。日付で絞り込み可
+- **スマホ画面（Render）**: ワイモバイル／ドコモを切り替えて、都道府県（または現在地の近く）の全店舗をまとめて調べ、予約できる開始時刻を空きのある店だけ早い順に表示。日付で絞り込み可
 - **自動通知（GitHub Actions）**: 8:00〜21:00 に15分ごとに確認し、新しく空いた枠を Discord に通知
 
 ## 初期設定
@@ -32,3 +32,12 @@
 
 公式サイトの店舗ページが使っている公開データ（`/shop/api_json.php`、`/shop/api/shop_traffic.php`）を読み、
 来店目的ごとの予約できる開始時刻を出します（ソフトバンクショップとワイモバイルショップでは業務コードが違うので自動で切り替え）。負荷をかけないようリクエスト間隔をあけています。
+
+## ドコモ
+
+- 店舗一覧: `shop.smt.docomo.ne.jp/api/shopsearch/shoplist?prefCode=11`（JIS 都道府県コード、30件ずつ）
+- 空き状況: `reservation.ald.smt.docomo.ne.jp/VIEW_RESERVATION/rif/ns/RI/v1/shops/{13桁店舗コード}/visitor-reserve/unserved-list`
+  （dアカウントなし予約と同じデータ。各時刻の `reserved_frame < total_frame` なら予約可）
+- 自動取得の対象は `config.json` の `docomo_snapshot_prefs` / `docomo_snapshot_purposes`
+- 来店目的: `change`（機種変更）/ `mnp_in`（他社からお乗りかえ）/ `new` / `plan` / `repair` / `cancel`（解約）/ `other`
+- ドコモのサーバーは古い TLS 再ネゴシエーションを使うため、`OP_LEGACY_SERVER_CONNECT` を付けて接続（証明書検証はそのまま）

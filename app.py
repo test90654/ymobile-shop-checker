@@ -21,6 +21,7 @@ from pathlib import Path
 
 from flask import Flask, Response, jsonify, render_template_string, request
 
+import docomo
 import ymobile as ym
 
 app = Flask(__name__)
@@ -42,8 +43,17 @@ def config():
         return {}
 
 
-def snapshot_name(pref, purpose):
-    return f"{ym.PREFS.index(pref) + 1:02d}_{purpose}.json"
+CARRIERS = {
+    "ymobile": {"name": "ワイモバイル", "purposes": {k: v[0] for k, v in ym.PURPOSES.items()},
+                "default": ym.DEFAULT_PURPOSE},
+    "docomo": {"name": "ドコモ", "purposes": {k: v[0] for k, v in docomo.PURPOSES.items()},
+               "default": docomo.DEFAULT_PURPOSE},
+}
+
+
+def snapshot_name(pref, purpose, carrier="ymobile"):
+    base = f"{ym.PREFS.index(pref) + 1:02d}_{purpose}.json"
+    return base if carrier == "ymobile" else f"{carrier}_{base}"
 
 
 def gh(method, path, body=None, raw=False):
@@ -84,14 +94,23 @@ def available():
         cfg = config()  # 取れなければ自動更新の対象から推測
         names = [snapshot_name(p, ym.norm_purpose(u)) for p in cfg.get("snapshot_prefs") or []
                  if p in ym.PREFS for u in cfg.get("snapshot_purposes") or ["mnp_out"]]
+        names += [snapshot_name(p, docomo.norm_purpose(u), "docomo")
+                  for p in cfg.get("docomo_snapshot_prefs") or []
+                  if p in ym.PREFS for u in cfg.get("docomo_snapshot_purposes") or ["change"]]
     out = []
     for n in names:
         try:
-            code, purpose = n[:-5].split("_", 1)
-            if purpose in ym.PURPOSES:
-                out.append({"pref": ym.PREFS[int(code) - 1], "purpose": purpose,
-                            "label": f"{ym.PREFS[int(code) - 1]}・{ym.PURPOSES[purpose][0]}"})
-        except (ValueError, IndexError):
+            stem = n[:-5]
+            carrier = "ymobile"
+            if stem.startswith("docomo_"):
+                carrier, stem = "docomo", stem[len("docomo_"):]
+            code, purpose = stem.split("_", 1)
+            c = CARRIERS[carrier]
+            if purpose in c["purposes"]:
+                pref = ym.PREFS[int(code) - 1]
+                out.append({"carrier": carrier, "pref": pref, "purpose": purpose,
+                            "label": f"{c['name']}・{pref}・{c['purposes'][purpose]}"})
+        except (ValueError, IndexError, KeyError):
             continue
     with _lock:
         _snap_cache["__list__"] = (time.time(), out)
@@ -118,13 +137,16 @@ def load_snapshot(name):
 
 
 def args():
+    carrier = request.values.get("carrier", "ymobile")
     pref = request.values.get("pref", "")
-    purpose = request.values.get("purpose", ym.DEFAULT_PURPOSE)
+    if carrier not in CARRIERS:
+        return None, None, None, (jsonify(error="キャリアが不正です"), 400)
+    purpose = request.values.get("purpose", CARRIERS[carrier]["default"])
     if pref not in ym.PREFS:
-        return None, None, (jsonify(error="都道府県名が不正です"), 400)
-    if purpose not in ym.PURPOSES:
-        return None, None, (jsonify(error="来店目的が不正です"), 400)
-    return pref, purpose, None
+        return None, None, None, (jsonify(error="都道府県名が不正です"), 400)
+    if purpose not in CARRIERS[carrier]["purposes"]:
+        return None, None, None, (jsonify(error="来店目的が不正です"), 400)
+    return carrier, pref, purpose, None
 
 
 @app.get("/")
@@ -133,19 +155,21 @@ def index():
     prefs = cfg.get("snapshot_prefs") or []
     pref = cfg.get("prefecture") or (prefs[0] if prefs else "埼玉県")
     pref = pref if pref in ym.PREFS else "埼玉県"
+    carriers = {k: {"name": v["name"], "purposes": v["purposes"], "default": v["default"]}
+                for k, v in CARRIERS.items()}
+    carriers["ymobile"]["default"] = ym.norm_purpose(cfg.get("purpose"))
     return render_template_string(
-        PAGE, purposes={k: v[0] for k, v in ym.PURPOSES.items()},
-        purpose=ym.norm_purpose(cfg.get("purpose")), prefs=ym.PREFS, pref=pref,
+        PAGE, carriers_json=json.dumps(carriers, ensure_ascii=False), prefs=ym.PREFS, pref=pref,
         can_refresh=bool(TOKEN))
 
 
 @app.get("/api/snapshot")
 def api_snapshot():
-    pref, purpose, err = args()
+    carrier, pref, purpose, err = args()
     if err:
         return err
     try:
-        body = load_snapshot(snapshot_name(pref, purpose))
+        body = load_snapshot(snapshot_name(pref, purpose, carrier))
     except Exception as e:  # noqa: BLE001
         return jsonify(error=f"GitHub から結果を読めませんでした（{e}）"), 502
     if body is None:
@@ -158,12 +182,12 @@ def api_snapshot():
 
 @app.post("/api/refresh")
 def api_refresh():
-    pref, purpose, err = args()
+    carrier, pref, purpose, err = args()
     if err:
         return err
     if not TOKEN:
         return jsonify(error="Render に GITHUB_TOKEN が設定されていないため、最新取得を依頼できません"), 503
-    name = snapshot_name(pref, purpose)
+    name = snapshot_name(pref, purpose, carrier)
     with _lock:
         last = _last_refresh.get(name, 0)
         if time.time() - last < REFRESH_COOLDOWN_SEC:
@@ -171,7 +195,7 @@ def api_refresh():
         _last_refresh[name] = time.time()
     try:
         gh("POST", f"/repos/{REPO}/actions/workflows/snapshot.yml/dispatches",
-           {"ref": "main", "inputs": {"pref": pref, "purpose": purpose}})
+           {"ref": "main", "inputs": {"carrier": carrier, "pref": pref, "purpose": purpose}})
     except urllib.error.HTTPError as e:
         with _lock:
             _last_refresh.pop(name, None)
@@ -190,7 +214,7 @@ PAGE = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#0b1f3a">
-<title>ワイモバ空き状況</title>
+<title>ショップ空き状況</title>
 <style>
 :root{
   --bg:#f4f5f7; --card:#fff; --ink:#15181d; --sub:#5d6470; --line:#e3e6ea;
@@ -208,7 +232,11 @@ body{margin:0;background:var(--bg);color:var(--ink);
   font:15px/1.5 -apple-system,BlinkMacSystemFont,"Hiragino Sans","Noto Sans JP",sans-serif;
   padding-bottom:env(safe-area-inset-bottom)}
 header{background:var(--accent);color:var(--on-accent);padding:14px 16px}
-h1{margin:0 0 4px;font-size:18px}
+h1{margin:0 0 10px;font-size:18px}
+.seg{display:flex;background:rgba(255,255,255,.14);border-radius:10px;padding:3px}
+@media (prefers-color-scheme: dark){.seg{background:rgba(0,0,0,.14)}}
+.seg button{flex:1;font:inherit;font-size:14px;border:0;border-radius:8px;padding:7px;background:none;color:inherit;cursor:pointer}
+.seg button.on{background:var(--card);color:var(--ink);font-weight:700}
 select,input{display:block;width:100%;font:inherit;font-size:16px;color:var(--ink);background:var(--card);
   border:1px solid var(--line);border-radius:10px;padding:10px 12px}
 label{display:block;font-size:12px;opacity:.85;margin:8px 0 4px}
@@ -254,7 +282,8 @@ main{padding:10px 16px 40px;max-width:640px;margin:0 auto}
 </head>
 <body>
 <header>
-  <h1>ワイモバイル 来店予約の空き</h1>
+  <h1>ショップ来店予約の空き</h1>
+  <div class="seg" id="carrier"><button data-c="ymobile">ワイモバイル</button><button data-c="docomo">ドコモ</button></div>
   <div class="row2">
     <div><label for="pref">都道府県</label>
       <select id="pref">{% for p in prefs %}<option{% if p == pref %} selected{% endif %}>{{ p }}</option>{% endfor %}</select></div>
@@ -262,7 +291,7 @@ main{padding:10px 16px 40px;max-width:640px;margin:0 auto}
       <input id="city" placeholder="例: 本庄 / 春日部" autocomplete="off"></div>
   </div>
   <label for="purpose">来店目的</label>
-  <select id="purpose">{% for k, v in purposes.items() %}<option value="{{ k }}"{% if k == purpose %} selected{% endif %}>{{ v }}</option>{% endfor %}</select>
+  <select id="purpose"></select>
 </header>
 <main>
   <div class="stat">
@@ -278,17 +307,30 @@ main{padding:10px 16px 40px;max-width:640px;margin:0 auto}
 </main>
 <script>
 const CAN_REFRESH = {{ 'true' if can_refresh else 'false' }};
+const CARRIERS = {{ carriers_json|safe }};
 const WEEK = "日月火水木金土";
 const $ = s => document.querySelector(s);
 const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
 const store = { get(k){ try{ return localStorage.getItem(k); }catch(e){ return null; } }, set(k,v){ try{ localStorage.setItem(k,v); }catch(e){} } };
 
 let snap = null, dateSel = "all", here = null, polling = 0;
+let carrier = CARRIERS[store.get("carrier")] ? store.get("carrier") : "ymobile";
 
-for (const id of ["pref","purpose","city"]) { const v = store.get(id); if (v) { const e = $("#"+id); if (e.tagName !== "SELECT" || [...e.options].some(o=>o.value===v)) e.value = v; } }
+function setCarrier(c){
+  carrier = c; store.set("carrier", c);
+  document.querySelectorAll("#carrier button").forEach(b => b.classList.toggle("on", b.dataset.c === c));
+  const sel = $("#purpose"); sel.innerHTML = "";
+  for (const [k, v] of Object.entries(CARRIERS[c].purposes)) { const o = el("option", null, v); o.value = k; sel.append(o); }
+  const saved = store.get("purpose_" + c);
+  sel.value = saved && CARRIERS[c].purposes[saved] ? saved : CARRIERS[c].default;
+}
+setCarrier(carrier);
+document.querySelectorAll("#carrier button").forEach(b => b.onclick = () => { if (b.dataset.c !== carrier) { setCarrier(b.dataset.c); load(); } });
+
+for (const id of ["pref","city"]) { const v = store.get(id); if (v) { const e = $("#"+id); if (e.tagName !== "SELECT" || [...e.options].some(o=>o.value===v)) e.value = v; } }
 $("#near").checked = store.get("near") === "1";
 
-function q(){ return `pref=${encodeURIComponent($("#pref").value)}&purpose=${encodeURIComponent($("#purpose").value)}`; }
+function q(){ return `carrier=${carrier}&pref=${encodeURIComponent($("#pref").value)}&purpose=${encodeURIComponent($("#purpose").value)}`; }
 async function getJSON(url, opt){
   const r = await fetch(url, opt); const j = await r.json().catch(()=>({error:"応答を読めませんでした（サーバー起動中かもしれません。少し待って再読み込みしてください）"}));
   if (!r.ok) throw new Error(j.error || r.status); return j;
@@ -314,7 +356,8 @@ function km(s){
 }
 
 async function load(){
-  ["pref","purpose","city"].forEach(id => store.set(id, $("#"+id).value));
+  ["pref","city"].forEach(id => store.set(id, $("#"+id).value));
+  store.set("purpose_" + carrier, $("#purpose").value);
   const my = ++polling;
   snap = null; dateSel = "all"; render();
   $("#stext").textContent = "読み込み中…（初回はサーバー起動に30秒ほどかかります）";
@@ -332,20 +375,20 @@ async function load(){
 }
 
 function showMissing(av){
-  $("#stext").textContent = `${$("#pref").value}・${$("#purpose").selectedOptions[0].text} のデータはまだありません。`;
+  $("#stext").textContent = `${CARRIERS[carrier].name}・${$("#pref").value}・${$("#purpose").selectedOptions[0].text} のデータはまだありません。`;
   const list = $("#list"); list.innerHTML = "";
   const box = el("div","card");
   if (av.length) {
     box.append(el("div","meta","保存済みのデータ（タップで表示）"));
     av.forEach(a => {
       const b = el("button","btn", a.label); b.style.margin = "8px 8px 0 0";
-      b.onclick = () => { $("#pref").value = a.pref; $("#purpose").value = a.purpose; load(); };
+      b.onclick = () => { setCarrier(a.carrier); $("#pref").value = a.pref; $("#purpose").value = a.purpose; load(); };
       box.append(b);
     });
   }
   box.append(el("div","meta",
     "ほかの県・目的を見るには、Render に GITHUB_TOKEN を設定して「最新にする」を使うか、" +
-    "config.json の snapshot_prefs / snapshot_purposes に追加してください（30分ごとに自動取得）。"));
+    "config.json の自動取得の対象（snapshot_prefs / docomo_snapshot_prefs など）に追加してください（30分ごとに自動取得）。"));
   box.lastChild.style.marginTop = "10px";
   list.append(box);
 }
@@ -360,7 +403,7 @@ async function refresh(auto){
   const t0 = Date.now();
   while (my === polling && Date.now() - t0 < 6*60000) {
     const sec = Math.round((Date.now() - t0) / 1000);
-    $("#stext").textContent = base + `GitHubで最新の空きを取得中…（${sec}秒、1〜2分かかります）`;
+    $("#stext").textContent = base + `GitHubで最新の空きを取得中…（${sec}秒、${carrier === "docomo" ? "2〜3" : "1〜2"}分かかります）`;
     await new Promise(r => setTimeout(r, 5000));
     if (my !== polling) return;
     if ((Date.now() - t0) / 1000 < 30) continue;
