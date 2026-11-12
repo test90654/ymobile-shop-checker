@@ -10,6 +10,7 @@
 
 import datetime as dt
 import json
+import ssl
 import time
 import urllib.error
 import urllib.parse
@@ -46,6 +47,12 @@ JST = dt.timezone(dt.timedelta(hours=9))
 SAME_DAY_MARGIN_MIN = 15  # 当日は開始15分前まで（公式の deadline_for_same_day_reservation=-15）
 
 
+# ドコモのサーバーは古い TLS 再ネゴシエーションを使うため、OpenSSL 3 の既定では接続できない。
+# 証明書の検証はそのままで、レガシー再ネゴシエーションだけ許可する。
+_SSL = ssl.create_default_context()
+_SSL.options |= getattr(ssl, "OP_LEGACY_SERVER_CONNECT", 0x4)
+
+
 def norm_purpose(p):
     return p if p in PURPOSES else DEFAULT_PURPOSE
 
@@ -53,7 +60,7 @@ def norm_purpose(p):
 def get_json(url, referer):
     req = urllib.request.Request(url, headers=dict(HEADERS, Referer=referer))
     try:
-        with urllib.request.urlopen(req, timeout=20) as r:
+        with urllib.request.urlopen(req, timeout=20, context=_SSL) as r:
             body = r.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as e:
         raise FetchError(f"HTTP {e.code}") from e
