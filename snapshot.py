@@ -87,7 +87,11 @@ def main():
     ap.add_argument("--out", default="data")
     a = ap.parse_args()
     purpose = docomo.norm_purpose(a.purpose) if a.carrier == "docomo" else ym.norm_purpose(a.purpose)
-    data = build(a.pref, purpose, a.carrier)
+    try:
+        data = build(a.pref, purpose, a.carrier)
+    except Exception as e:  # noqa: BLE001  実行結果画面に原因を出す
+        print(f"::error title=snapshot {a.carrier} {a.pref}::{type(e).__name__}: {e}")
+        raise
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     path = out / snapshot_name(a.pref, purpose, a.carrier)
