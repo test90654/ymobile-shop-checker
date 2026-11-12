@@ -16,5 +16,12 @@
   ],
   "snapshot_purposes": [
     "mnp_out"
+  ],
+  "docomo_snapshot_prefs": [
+    "埼玉県",
+    "群馬県"
+  ],
+  "docomo_snapshot_purposes": [
+    "change"
   ]
 }

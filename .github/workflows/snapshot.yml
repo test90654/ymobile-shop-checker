@@ -9,6 +9,10 @@ on:
     - cron: "12,42 0-11 * * *"
   workflow_dispatch:
     inputs:
+      carrier:
+        description: "ymobile / docomo（空なら config.json の対象すべて）"
+        type: string
+        default: ""
       pref:
         description: "都道府県（空なら config.json の snapshot_prefs）"
         type: string
@@ -22,13 +26,13 @@ permissions:
   contents: write
 
 concurrency:
-  group: snapshot-${{ inputs.pref }}-${{ inputs.purpose }}
+  group: snapshot-${{ inputs.carrier }}-${{ inputs.pref }}-${{ inputs.purpose }}
   cancel-in-progress: true
 
 jobs:
   snapshot:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
 
@@ -38,17 +42,25 @@ jobs:
 
       - name: Fetch availability
         env:
+          IN_CARRIER: ${{ inputs.carrier }}
           IN_PREF: ${{ inputs.pref }}
           IN_PURPOSE: ${{ inputs.purpose }}
         run: |
           python - <<'PY'
           import json, os, subprocess
           cfg = json.load(open("config.json", encoding="utf-8"))
-          prefs = [os.environ["IN_PREF"]] if os.environ.get("IN_PREF") else cfg.get("snapshot_prefs") or []
-          purposes = [os.environ["IN_PURPOSE"]] if os.environ.get("IN_PURPOSE") else cfg.get("snapshot_purposes") or ["mnp_out"]
-          for p in prefs:
-              for u in purposes:
-                  subprocess.run(["python", "snapshot.py", "--pref", p, "--purpose", u, "--out", "out"], check=False)
+          env = lambda k: os.environ.get(k, "").strip()
+          if env("IN_PREF"):  # 画面の「最新にする」などからの依頼
+              jobs = [(env("IN_CARRIER") or "ymobile", env("IN_PREF"), env("IN_PURPOSE"))]
+          else:               # 定期実行: config.json の対象
+              jobs = [("ymobile", p, u) for p in cfg.get("snapshot_prefs") or []
+                      for u in cfg.get("snapshot_purposes") or ["mnp_out"]]
+              jobs += [("docomo", p, u) for p in cfg.get("docomo_snapshot_prefs") or []
+                       for u in cfg.get("docomo_snapshot_purposes") or ["change"]]
+              if env("IN_CARRIER"):
+                  jobs = [j for j in jobs if j[0] == env("IN_CARRIER")]
+          for c, p, u in jobs:
+              subprocess.run(["python", "snapshot.py", "--carrier", c, "--pref", p, "--purpose", u, "--out", "out"], check=False)
           PY
           ls -la out || true
 
